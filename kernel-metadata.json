@@ -1,0 +1,19 @@
+{
+  "id": "definitlynotme/training-an-LLM-v3",
+  "title": "Training an LLM v3",
+  "code_file": "train_notebook.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "machine_shape": "",
+  "dataset_sources": [
+    "definitlynotme/llm-training-data",
+    "zhanglinghua011228/openwebtext"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

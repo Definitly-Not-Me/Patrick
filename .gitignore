@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+.mypy_cache/
+assets/
+.venv/
+._build/
+_build/
+tests/
+./TODO.md
+.cache/
+.venv/
+text/.venv/
+text/training-an-llm-v1.log
+
+# large artifacts
+val.bin
+model_checkpoint_best_model.pt
+model_checkpoint.pt
+results/
+results.zip
+ffr-v1/
+
+# scratch / repro
+.ipynb_checkpoints/
+_repro_rich*.py
+_repro_rich*.ipynb
+_mk_repro_nb.py
+_sim_argparse.py
+_sim_kernel.py

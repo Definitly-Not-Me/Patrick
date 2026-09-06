@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.mypy_cache/
+.venv/
+_build/
+tests/
+TODO.md
+assets/
+.cache/
+text/.venv/
+text/training-an-llm-v1.log
+

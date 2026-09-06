@@ -152,6 +152,6 @@ if __name__ == "__main__":
         print("\nUse --input-dir to target a specific dataset, e.g.:")
         print("  python inspect_dataset.py --input-dir /kaggle/input/llm-training-data")
     else:
-        input_dir = Path(__file__).resolve().parent / "text"
+        input_dir = Path(__file__).resolve().parents[1] / "text"
 
     inspect(input_dir)

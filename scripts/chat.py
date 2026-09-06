@@ -1,10 +1,14 @@
 # /usr/bin/env python3
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
 from tiktoken import get_encoding
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 import train
 

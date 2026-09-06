@@ -1,8 +1,10 @@
 import json
 import os
 
-OUT = os.path.join(os.path.dirname(__file__), "train_notebook.ipynb")
-SRC = os.path.join(os.path.dirname(__file__), "train.py")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+OUT = os.path.join(ROOT, "train_notebook.ipynb")
+SRC = os.path.join(ROOT, "train.py")
 
 with open(SRC, "r", encoding="utf-8") as fh:
     source = fh.read()

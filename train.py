@@ -11,13 +11,15 @@ from time import perf_counter
 import torch
 from torch import Tensor, device, nn
 from torch.amp import GradScaler, autocast
-from torch.optim.optimizer import Optimizer
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, IterableDataset
 from tiktoken import Encoding
 import tiktoken
 import hashlib
 import pickle
 import numpy as np
+from datasets import load_dataset
+from dotenv import load_dotenv
+from requests.exceptions import ConnectionError, ChunkedEncodingError
 
 
 # Base dir: notebook kernels don't define __file__, and src/ is absent there
@@ -35,6 +37,7 @@ IS_KAGGLE = bool(os.getenv("KAGGLE_KERNEL_RUN_TYPE"))
 WORK_DIR = Path("/kaggle/working") if IS_KAGGLE else SCRIPT_DIR
 _KAGGLE_INPUT = Path("/kaggle/input")
 
+load_dotenv()
 
 def _detect_input_dir() -> Path:
     """On Kaggle, find the directory containing the text corpus (not openwebtext bins)."""
@@ -77,6 +80,45 @@ def load_tokens(txt: str, tokenizer: Encoding) -> list[int]:
             tokens_ids = tokenizer.encode(txt, allowed_special={"<|endoftext|>"})
             pickle.dump(tokens_ids, file)
     return tokens_ids
+
+def safe_next(it, max_retries=3, backoff=2.0)->dict | None:
+    """Retry on transient network errors, raise on permanent ones."""
+    for attempt in range(max_retries):
+        try:
+            return next(it)
+        except (ConnectionError,
+                ChunkedEncodingError) as e:
+            print(f"Failed to connect to hugging face. Retrying. [{attempt}/{max_retries}]")
+            if attempt == max_retries - 1:
+                raise e
+            time.sleep(backoff * (attempt + 1))
+
+def get_tokens(
+    it,
+    tokenizer,
+    suffix: int,
+) -> list[int] | None:
+    """
+    Retourne une liste des tokens renvoyés par next(it).
+    """
+    try:
+        example = safe_next(it)
+    except StopIteration:
+        return None
+
+    if "input_ids" in example:
+        # Pre-tokenized
+        ids = example["input_ids"]
+
+        return ids if isinstance(ids, list) else [ids]
+
+    elif "text" in example:
+        # Raw text
+        return tokenizer.encode_ordinary(example["text"]) + [suffix]
+
+    else:
+        print("Unexpected response:", example)
+        return None
 
 
 class GPTDatasetV1(Dataset[tuple[Tensor, Tensor]]):
@@ -134,6 +176,108 @@ class GPTDatasetV2(Dataset):
 
         return x, y
 
+
+
+class GPTDatasetV3(IterableDataset):
+    """
+    Version du dataset tirant ses sources de hugging face.
+    Par souci d'optimisation du stockage, cette version
+    stream les fichiers et les tokenize ad hoc si besoin
+    """
+
+    def __init__(
+        self,
+        sources: list[dict],
+        tokenizer: Encoding,
+        context_length: int,
+        stride: int,
+        seed: int,
+        split: str,
+    ) -> None:
+        """
+        Args:
+            sources: list de dict de format [{"path": "chemin/dataset", "name": "nom_dossier", "weight": 10}, ...]
+            weight: Combien de documents prendre de 'nom_dossier' par round
+        """
+        self.sources = sources
+        self.tokenizer = tokenizer
+        self.ctx = context_length
+        self.stride = stride
+        self.seed = seed
+        self.split = split
+        self._length = 0
+
+        # Estimation du nombre de tokens
+        for src in self.sources:
+            print("Querying", src["path"], src["name"])
+            ds = load_dataset(
+                src["path"],
+                src.get("name"),
+                split=self.split,
+                streaming=True,
+            )
+            builder = ds.info.builder_name
+            num_examples = ds.info.splits["train"].num_examples
+            length = num_examples if builder == "parquet" else ds.dataset_size // 4
+            self._length += length
+
+
+    def __iter__(self) -> tuple[Tensor]:
+        buffer = []
+        eof_id = self.tokenizer._special_tokens["<|endoftext|>"]
+        iters = []
+        docs = 0
+
+        for src in self.sources:
+            print("Querying", src["path"], src["name"])
+            ds = load_dataset(
+                src["path"],
+                src.get("name"),
+                split=self.split,
+                streaming=True,
+            )
+            ds = ds.shuffle(buffer_size=10_000, seed=self.seed)
+
+            iters.append((iter(ds), int(src.get("weight", 1))))
+
+        while iters:
+            next_iters = []
+
+            for it, weight in iters:
+                pulled = 0
+
+                while pulled < weight:
+                    tokens = get_tokens(it, tokenizer=self.tokenizer, suffix=eof_id)
+                    if tokens is None:
+                        break
+
+                    pulled += 1
+
+                    buffer.extend(tokens)
+
+                    while len(buffer) >= self.ctx + 1:
+                        x = torch.tensor(
+                            buffer[: self.ctx],
+                            dtype=torch.long,
+                        )
+                        y = torch.tensor(
+                            buffer[1 : self.ctx + 1],
+                            dtype=torch.long,
+                        )
+
+                        yield x, y
+                        buffer = buffer[self.stride :]
+
+                else:
+                    docs += weight
+                    if docs % 500 == 0:
+                        print(f"[stream] {docs:,} docs")
+                    next_iters.append((it, weight))
+
+            iters = next_iters
+
+    def __len__(self) -> int:
+        return self._length
 
 def create_dataloader_v1(
     txt, batch_size, max_length, stride, shuffle=True, drop_last=True, num_workers=0
@@ -207,6 +351,37 @@ def create_dataloader_v2(
     )
 
     return train_loader, val_loader
+
+
+def create_dataloader_v3(
+    sources: list[dict],
+    batch_size: int,
+    context_length: int,
+    stride: int,
+    tokenizer: Encoding,
+    split: str,
+    num_workers: int = 0,
+    prefetch_factor: int = 4,
+    seed: int = 6,
+) -> DataLoader:
+
+    ds = GPTDatasetV3(
+        sources=sources,
+        tokenizer=tokenizer,
+        stride=stride,
+        context_length=context_length,
+        split=split,
+        seed=seed,
+    )
+
+    dataloader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    return dataloader
 
 
 # ------------------------ Config --------------------------------------
@@ -351,7 +526,6 @@ TRAINING_PRESET_PROD = dict(
 # ------------------------ Monitor ------------------------------------------
 
 
-
 # ── monitor ──────────────────────────────────────────────────────────────────
 
 
@@ -397,8 +571,6 @@ class Monitor:
 
     def close(self):
         print(f"[monitor] done in {time.time() - self.start_time:.1f}s", flush=True)
-
-
 
 
 # --------------------- CSV Logger -------------------------------------------
@@ -1067,53 +1239,75 @@ def train_model(
     model: GPTModel,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    optimizer: Optimizer,
-    tc: TrainingConfig,
+    config: TrainingConfig,
     tokenizer: Encoding,
     dev: device,
-    save_path: str | Path = ".",
-    start_epoch: int = 0,
-    global_step_offset: int = 0,
-    csv_path: Path | None = None,
-    monitor: "Monitor | None" = None,
+    monitor=None,
+    resume_from: Path | None = None,
+    save_dir: str | Path = ".",
 ) -> tuple[list, list, list, list]:
     """
     Entraînement avec warmup, cosine decay, gradient clipping.
     Sauvegarde automatiquement le modèle en cas d'interruption (Ctrl+C).
     Log les métriques d'évaluation dans un CSV horodaté.
     """
+    # TRACKERS
     train_losses, val_losses, track_tokens, track_lrs = [], [], [], []
-    tokens_seen, global_step = 0, global_step_offset - 1
+    tokens_seen, global_step = 0, -1
     best_val_loss = float("inf")
     best_train_loss = float("inf")
     loader_len = len(train_loader)
-    total_training_steps = loader_len * tc.num_epochs
+    total_training_steps = loader_len * config.num_epochs
 
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer=optimizer,
-        max_lr=optimizer.param_groups[0]["lr"],
-        total_steps=total_training_steps // tc.grad_accum_steps,
-        epochs=tc.num_epochs,
-        final_div_factor=tc.final_div_factor,
-        pct_start=tc.warmup_steps / max(total_training_steps // tc.grad_accum_steps, 1),
-    )
-
+    csv_path = make_csv_path(Path(save_dir))
     csv_writer, csv_file = open_csv(csv_path) if csv_path else (None, None)
 
-    scaler = GradScaler(enabled=dev.type == "cuda")
+    if resume_from:
+        checkpoint = load_checkpoint(resume_from, dev, config.model)
+        model = checkpoint["model"]
+        optimizer = checkpoint["optimizer"]
+        scaler = checkpoint["scaler"]
+        scheduler = checkpoint["scheduler"]
+        global_step = checkpoint["global_step"]
+        start_epoch = checkpoint["epoch"]
+        best_train_loss = checkpoint["best_train_loss"]
+        best_val_loss = checkpoint["best_val_loss"]
+        model._size()
+        model.to(dev)
+
+        print(f"Resumed from {resume_from} (epoch {start_epoch}, step {global_step})\n")
+
+    else:
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer=optimizer,
+            max_lr=optimizer.param_groups[0]["lr"],
+            total_steps=total_training_steps // config.grad_accum_steps,
+            epochs=config.num_epochs,
+            final_div_factor=config.final_div_factor,
+            pct_start=config.warmup_steps
+            / max(total_training_steps // config.grad_accum_steps, 1),
+        )
+
+        scaler = GradScaler(enabled=dev.type == "cuda")
+        start_epoch = 0
+
+    # Nécessaire de le définir à l'intérieur pour simplifier la sauvegarde
 
     def _save_checkpoint(tag: str):
-        if save_path is None:
-            return
-        path = Path(save_path)
+        path = Path(save_dir)
         path = path.with_name(f"{path.stem}_{tag}{path.suffix}")
         path.parent.mkdir(exist_ok=True, parents=True)
+
         torch.save(
             {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "global_step": global_step,
-                "epoch": epoch + 1,
+                "epoch": epoch,
                 "best_val_loss": best_val_loss,
                 "best_train_loss": best_train_loss,
                 "scheduler": scheduler.state_dict(),
@@ -1125,17 +1319,18 @@ def train_model(
 
     try:
         model.train()
-        for epoch in range(start_epoch, tc.num_epochs):
+        for epoch in range(start_epoch, config.num_epochs):
             optimizer.zero_grad()
 
             for i, (input_batch, target_batch) in enumerate(train_loader):
-                should_step = (i + 1) % tc.grad_accum_steps == 0 or (
+                should_step = (i + 1) % config.grad_accum_steps == 0 or (
                     i + 1
                 ) == loader_len
                 with autocast(device_type=dev.type, enabled=dev.type == "cuda"):
                     accumulation = min(
-                        tc.grad_accum_steps,
-                        loader_len - (i // tc.grad_accum_steps) * tc.grad_accum_steps,
+                        config.grad_accum_steps,
+                        loader_len
+                        - (i // config.grad_accum_steps) * config.grad_accum_steps,
                     )
                     loss = (
                         calc_loss_batch(input_batch, target_batch, model, dev)
@@ -1143,6 +1338,7 @@ def train_model(
                     )
 
                 scaler.scale(loss).backward()
+                tokens_seen += input_batch.numel()
 
                 if should_step:
                     global_step += 1
@@ -1151,9 +1347,9 @@ def train_model(
 
                     grad_norm = (
                         torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), max_norm=tc.max_grad_norm
+                            model.parameters(), max_norm=config.max_grad_norm
                         )
-                        if global_step > tc.warmup_steps
+                        if global_step > config.warmup_steps
                         else 0.0
                     )
 
@@ -1166,16 +1362,15 @@ def train_model(
 
                     lr_now = float(scheduler.get_last_lr()[0])
 
-                    tokens_seen += input_batch.numel() * tc.grad_accum_steps
                     track_lrs.append(lr_now)
 
-                    if global_step % tc.eval_freq == 0:
-                        example = tc.example
+                    if global_step % config.eval_freq == 0:
+                        example = config.example
 
                         torch.cuda.empty_cache()
 
                         train_loss, val_loss = evaluate_model(
-                            model, train_loader, val_loader, dev, tc.num_batches
+                            model, train_loader, val_loader, dev, config.num_batches
                         )
                         train_losses.append(train_loss)
                         val_losses.append(val_loss)
@@ -1227,7 +1422,7 @@ def train_model(
                             model,
                             tokenizer,
                             example,
-                            tc.sample_length or tc.model.context_length,
+                            config.sample_length or config.model.context_length,
                             dev,
                         )
                         print("=" * 60)
@@ -1239,13 +1434,13 @@ def train_model(
                             f"  Val Loss:   {val_loss:.4f} (best: {best_val_loss:.4f})"
                         )
                         print(
-                            f"  Epoch:      {epoch + 1}/{tc.num_epochs} (step {global_step:,})"
+                            f"  Epoch:      {epoch + 1}/{config.num_epochs} (step {global_step:,})"
                         )
 
-            if len(train_loader) % tc.grad_accum_steps != 0:
+            if len(train_loader) % config.grad_accum_steps != 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=tc.max_grad_norm
+                    model.parameters(), max_norm=config.max_grad_norm
                 )
                 scaler.step(optimizer)
                 scaler.update()
@@ -1309,9 +1504,32 @@ def _append_openwebtext(
     return new_train_loader, new_val_loader
 
 
-def split_corpus(corpus: str, train_ratio: float = 0.9) -> tuple[str, str]:
-    split = int(len(corpus) * train_ratio)
-    return corpus[:split], corpus[split:]
+def load_checkpoint(filepath: Path, dev: device, config: GPTConfig) -> dict:
+    with torch.device("meta"):
+        model = GPTModel(config)
+        scaler = GradScaler(enabled=dev.type == "cuda")
+
+    checkpoint = torch.load(filepath, map_location=dev, weights_only=False)
+    model.load_state_dict(checkpoint["model"], assign=True, strict=True)
+
+    optimizer = torch.optim.AdamW(params=model.parameters())
+    optimizer.load_state_dict(checkpoint["optimizer"])
+
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer=optimizer, max_lr=optimizer.param_groups[0]["lr"]
+    )
+    scheduler.load_state_dict(checkpoint["scheduler"])
+
+    scaler.load_state_dict(checkpoint["scaler"])
+
+    print("Successfully Loaded checkpoint from ", str(filepath))
+
+    checkpoint["model"] = model
+    checkpoint["scheduler"] = scheduler
+    checkpoint["optimizer"] = optimizer
+    checkpoint["scaler"] = scaler
+
+    return checkpoint
 
 
 def get_device(testing: bool) -> torch.device:
@@ -1337,25 +1555,101 @@ def build_config(testing: bool) -> TrainingConfig:
     return TrainingConfig(**TRAINING_PRESET_PROD)
 
 
+def resume() -> None:
+    testing = os.getenv("testing") == "1"
+    tc = build_config(testing)
+    tokenizer = tiktoken.get_encoding(tc.tokenizer_encoding)
+    dev = get_device(testing)
+    max_length = tc.model.context_length
+    stride = int(max_length * tc.stride_ratio)
+    num_workers = 2
+
+    train_sources = [
+        {
+            "path": "HuggingFaceFW/fineweb-2",
+            "name": "fra_Latn",
+            "weight": 5,
+        },
+        {
+            "path": "HuggingFaceFW/fineweb-2",
+            "name": "fon_Latn",
+            "weight": 2,
+        },
+        {
+            "path": "dhlak/finewebedu-10b-gpt2-tokenized",
+            "name": "default",
+            "weight": 4,
+        },
+    ]
+
+    val_sources = [
+        {
+            "path": "HuggingFaceFW/fineweb-2",
+            "name": "fra_Latn",
+            "weight": 1,
+        },
+    ]
+
+    torch.manual_seed(tc.seed)
+
+    train_loader = create_dataloader_v3(
+        sources=train_sources,
+        batch_size=tc.batch_size,
+        context_length=max_length,
+        stride=stride,
+        num_workers=num_workers,
+        split="train",
+        tokenizer=tokenizer,
+    )
+    val_loader = create_dataloader_v3(
+        sources=val_sources,
+        batch_size=tc.batch_size,
+        context_length=max_length,
+        stride=stride,
+        num_workers=num_workers,
+        split="test",
+        tokenizer=tokenizer,
+    )
+
+    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}\n")
+
+    if testing:
+        load_path = input(">>Spécifiez le chemin du fichier de sauvegarde: ")
+        load_path = Path(load_path)
+    else:
+
+        load_path = Path(
+            "../input/models/definitlynotme/patrick-gpt2/pytorch/default/1/model_checkpoint_best_model.pt"
+        )
+
+    model = GPTModel(tc.model).to(dev)
+    model._size()
+
+    # ── Train ──
+
+    monitor = Monitor()
+    train_losses, val_losses, track_tokens, track_lrs = train_model(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        save_dir=WORK_DIR,
+        config=tc,
+        dev=dev,
+        tokenizer=tokenizer,
+        model=model,
+        resume_from=load_path
+    )
+    monitor.close()
+
+    final_path = WORK_DIR / "model_final.pt"
+    torch.save(model.state_dict(), final_path)
+    print(f"\nModel saved to {final_path}")
+
+
+
 def main():
-    import argparse
     from tiktoken import get_encoding
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--test", action="store_true", help="Quick sanity check with small config"
-    )
-    parser.add_argument(
-        "--resume", type=str, default=None, help="Path to checkpoint to resume from"
-    )
-    # Notebook kernels don't have our CLI args in sys.argv (they carry the
-    # kernel launcher's own args), so fall back to defaults there.
-    if "__file__" in globals():
-        args = parser.parse_args()
-    else:
-        args = parser.parse_args([])
-
-    testing = os.getenv("testing") == "1" or args.test
+    testing = os.getenv("testing") == "1"
 
     tc = build_config(testing)
 
@@ -1381,8 +1675,8 @@ def main():
     )
 
     # Append pretokenized OpenWebText (tokenizer must be gpt-2)
-    if IS_KAGGLE:
-        train_loader, val_loader = _append_openwebtext(train_loader, val_loader)
+    # if IS_KAGGLE:
+    #     train_loader, val_loader = _append_openwebtext(train_loader, val_loader)
 
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}\n")
 
@@ -1392,26 +1686,8 @@ def main():
 
     model._size()
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=tc.lr, weight_decay=tc.weight_decay
-    )
 
-    # ── Resume ──
-    start_epoch = 0
-    global_step_offset = 0
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=dev, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        global_step_offset = ckpt["global_step"]
-        start_epoch = ckpt["epoch"]
-        print(
-            f"Resumed from {args.resume} (epoch {start_epoch}, step {global_step_offset})\n"
-        )
 
-    # ── Save paths ──
-    save_path = WORK_DIR / "model_checkpoint.pt"
-    csv_path = make_csv_path(WORK_DIR)
 
     # ── Train ──
 
@@ -1420,14 +1696,10 @@ def main():
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        optimizer=optimizer,
-        tc=tc,
+        config=tc,
         tokenizer=tokenizer,
         dev=dev,
-        save_path=save_path,
-        start_epoch=start_epoch,
-        global_step_offset=global_step_offset,
-        csv_path=csv_path,
+        save_dir=WORK_DIR,
         monitor=monitor,
     )
     monitor.close()
@@ -1437,9 +1709,25 @@ def main():
     torch.save(model.state_dict(), final_path)
     print(f"\nModel saved to {final_path}")
 
-    # ── Plots ──
-    generate_plots(csv_path, WORK_DIR, tc.model_dump())
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--test", action="store_true", help="Quick sanity check with small config"
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None, help="Path to checkpoint to resume from"
+    )
+    # Notebook kernels don't have our CLI args in sys.argv (they carry the
+    # kernel launcher's own args), so fall back to defaults there.
+    if "__file__" in globals():
+        args = parser.parse_args()
+    else:
+        args = parser.parse_args([])
+    testing = args.test
+    if args.resume:
+        resume()
+    else:
+        main()

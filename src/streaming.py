@@ -8,29 +8,33 @@ import dotenv
 import time
 from requests.exceptions import ConnectionError, ChunkedEncodingError
 
-def safe_next(it, max_retries=3, backoff=2.0):
+
+
+def safe_next(it, max_retries=3, backoff=2.0)->dict | None:
     """Retry on transient network errors, raise on permanent ones."""
     for attempt in range(max_retries):
         try:
             return next(it)
         except (ConnectionError,
-                ChunkedEncodingError):
+                ChunkedEncodingError) as e:
             print(f"Failed to connect to hugging face. Retrying. [{attempt}/{max_retries}]")
             if attempt == max_retries - 1:
-                raise
+                raise e
             time.sleep(backoff * (attempt + 1))
+
 
 def get_tokens(
     it,
     tokenizer,
     suffix: int,
-) -> list[int]:
-
+) -> list[int] | None:
+    """
+    Retourne une liste des tokens renvoyés par next(it).
+    """
     try:
-        example = next(it)
-        print(f"Example: {str(example):.99}")
+        example = safe_next(it)
     except StopIteration:
-        return []
+        return None
 
     if "input_ids" in example:
         # Pre-tokenized
@@ -44,7 +48,9 @@ def get_tokens(
 
     else:
         print("Unexpected response:", example)
-        return []
+        return None
+
+
 
 class GPTDatasetV3(IterableDataset):
     """
@@ -53,7 +59,15 @@ class GPTDatasetV3(IterableDataset):
     stream les fichiers et les tokenize ad hoc si besoin
     """
 
-    def __init__(self, sources: list[dict], tokenizer: Encoding, context_length: int, stride: int, seed: int, split: str) -> None:
+    def __init__(
+        self,
+        sources: list[dict],
+        tokenizer: Encoding,
+        context_length: int,
+        stride: int,
+        seed: int,
+        split: str,
+    ) -> None:
         """
         Args:
             sources: list de dict de format [{"path": "chemin/dataset", "name": "nom_dossier", "weight": 10}, ...]
@@ -65,14 +79,31 @@ class GPTDatasetV3(IterableDataset):
         self.stride = stride
         self.seed = seed
         self.split = split
+        self._length = 0
+
+        # Estimation du nombre de tokens
+        for src in self.sources:
+            print("Querying", src["path"], src["name"])
+            ds = load_dataset(
+                src["path"],
+                src.get("name"),
+                split=self.split,
+                streaming=True,
+            )
+            builder = ds.info.builder_name
+            num_examples = ds.info.splits["train"].num_examples
+            length = num_examples if builder == "parquet" else ds.dataset_size // 4
+            self._length += length
 
 
     def __iter__(self) -> tuple[Tensor]:
         buffer = []
         eof_id = self.tokenizer._special_tokens["<|endoftext|>"]
         iters = []
+        docs = 0
+
         for src in self.sources:
-            print("Querying", src["path"],src["name"])
+            print("Querying", src["path"], src["name"])
             ds = load_dataset(
                 src["path"],
                 src.get("name"),
@@ -87,29 +118,40 @@ class GPTDatasetV3(IterableDataset):
             next_iters = []
 
             for it, weight in iters:
-                exhausted = False
+                pulled = 0
 
-                tokens = get_tokens(it, tokenizer=self.tokenizer, suffix=eof_id )
-                print(f"From {it} got tokens: \n{str(tokens):.99}")
-                buffer.extend(tokens)
-                print(f"Updated buffer {buffer[:99]}")
-                while len(buffer) >= self.ctx + 1:
-                    x = torch.tensor(
-                        buffer[:self.ctx],
-                        dtype=torch.long,
-                    )
-                    y = torch.tensor(
-                        buffer[1:self.ctx + 1],
-                        dtype=torch.long,
-                    )
+                while pulled < weight:
+                    tokens = get_tokens(it, tokenizer=self.tokenizer, suffix=eof_id)
+                    if tokens is None:
+                        break
 
-                    yield x, y
-                    buffer = buffer[self.stride:]
+                    pulled += 1
 
-                if not exhausted:
+                    buffer.extend(tokens)
+
+                    while len(buffer) >= self.ctx + 1:
+                        x = torch.tensor(
+                            buffer[: self.ctx],
+                            dtype=torch.long,
+                        )
+                        y = torch.tensor(
+                            buffer[1 : self.ctx + 1],
+                            dtype=torch.long,
+                        )
+
+                        yield x, y
+                        buffer = buffer[self.stride :]
+
+                else:
+                    docs += weight
+                    if docs % 500 == 0:
+                        print(f"[stream] {docs:,} docs")
                     next_iters.append((it, weight))
 
             iters = next_iters
+
+    def __len__(self) -> int:
+        return self._length
 
 def main()-> None:
     sources = [
@@ -140,4 +182,27 @@ def main()-> None:
 
 if __name__ == '__main__':
     dotenv.load_dotenv()
-    main()
+    # main()
+    sources = [
+        # {
+        #     "path": "HuggingFaceFW/fineweb-2",
+        #     "name": "fra_Latn",
+        #     "weight": 2,
+        # },
+
+        # {
+        #     "path": "HuggingFaceFW/fineweb",
+        #     "name": "CC-MAIN-2024-10",
+        #     "weight": 2,
+        # },
+
+        {
+            "path": "dhlak/finewebedu-10b-gpt2-tokenized",
+            "name": "default",
+            "weight": 1,
+        }
+    ]
+    tokenizer = tiktoken.get_encoding("gpt2")
+    dataset = GPTDatasetV3(sources=sources, context_length=1024, stride=512, tokenizer=tokenizer, seed=15, split="train")
+    loader = DataLoader(dataset, batch_size=8, num_workers=2, prefetch_factor=4)
+

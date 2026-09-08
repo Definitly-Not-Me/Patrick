@@ -16,6 +16,7 @@ let
     sympy
     pytest
     pip
+    datasets
   ];
 in
 pkgs.mkShell {
@@ -29,8 +30,6 @@ pkgs.mkShell {
     black
     mypy
   ];
-
-  venvDir = "/home/artem/projects/ml_learning/ml-venv";
 
   shellHook = ''
     # Add .wakatime to PATH only if it isn't already there

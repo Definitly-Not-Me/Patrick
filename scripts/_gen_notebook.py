@@ -14,10 +14,10 @@ if not source.endswith("\n"):
 
 source_lines = source.splitlines(keepends=True)
 
-# Strip the `if __name__ == "__main__": main()` guard so the definition cell
+# Strip the `if __name__ == "__main__": ...` guard so the definition cell
 # only defines things. Inside a notebook `__name__ == "__main__"`, so the guard
-# would auto-run training; instead we call main() explicitly in its own cell.
-guardless = source_lines[:-2]
+# would auto-run training; instead we call resume() explicitly in its own cell.
+guardless = source_lines[: source_lines.index('if __name__ == "__main__":\n')]
 
 cells = []
 
@@ -37,7 +37,8 @@ cells.append({
     "metadata": {},
     "outputs": [],
     "source": [
-        "!pip install --quiet torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121"
+        "!pip install --quiet torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121\n",
+        "!pip install --quiet datasets python-dotenv tiktoken",
     ],
 })
 
@@ -71,13 +72,13 @@ cells.append({
     "source": guardless,
 })
 
-# Run training.
+# Run training (resume from the mounted checkpoint).
 cells.append({
     "cell_type": "code",
     "execution_count": None,
     "metadata": {},
     "outputs": [],
-    "source": ["main()"],
+    "source": ["resume()"],
 })
 
 nb = {

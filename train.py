@@ -1,6 +1,7 @@
 import os
 import sys
 import csv
+import psutil
 from datetime import datetime
 from pathlib import Path
 import gzip
@@ -19,8 +20,9 @@ import pickle
 import numpy as np
 from datasets import load_dataset
 from dotenv import load_dotenv
-from requests.exceptions import ConnectionError, ChunkedEncodingError
-
+from requests.exceptions import ConnectionError, ChunkedEncodingError, HTTPError
+import requests
+from memory_profiler  import profile
 
 # Base dir: notebook kernels don't define __file__, and src/ is absent there
 # anyway (train.py is fully self-contained), so this is only meaningful when
@@ -36,8 +38,14 @@ SCRIPT_DIR = _BASE_DIR
 IS_KAGGLE = bool(os.getenv("KAGGLE_KERNEL_RUN_TYPE"))
 WORK_DIR = Path("/kaggle/working") if IS_KAGGLE else SCRIPT_DIR
 _KAGGLE_INPUT = Path("/kaggle/input")
+ENV = (
+    Path("../input/datasets/definitlynotme/llm-training-data/.env")
+    if Path("../input/datasets/definitlynotme/llm-training-data/.env").exists()
+    else Path().cwd()
+)
 
-load_dotenv()
+load_dotenv(ENV, verbose=True)
+
 
 def _detect_input_dir() -> Path:
     """On Kaggle, find the directory containing the text corpus (not openwebtext bins)."""
@@ -51,6 +59,13 @@ def _detect_input_dir() -> Path:
 
 INPUT_DIR = _detect_input_dir()
 
+# -------------------- Debugging --------------------------------------
+
+
+MB = 1024**2
+
+def _rss_mb() -> int:
+    return psutil.Process(os.getpid()).memory_info().rss / MB
 
 def _perf(label: str, start: float):
     """Print elapsed time since `start` with a label."""
@@ -58,6 +73,8 @@ def _perf(label: str, start: float):
 
 
 # ------------------------ Data --------------------------------------
+
+# == Helper functions for Dataset ==
 
 
 def load_tokens(txt: str, tokenizer: Encoding) -> list[int]:
@@ -81,17 +98,48 @@ def load_tokens(txt: str, tokenizer: Encoding) -> list[int]:
             pickle.dump(tokens_ids, file)
     return tokens_ids
 
-def safe_next(it, max_retries=3, backoff=2.0)->dict | None:
+
+def safe_next(it, max_retries=3, backoff=2.0) -> dict | None:
     """Retry on transient network errors, raise on permanent ones."""
     for attempt in range(max_retries):
         try:
             return next(it)
-        except (ConnectionError,
-                ChunkedEncodingError) as e:
-            print(f"Failed to connect to hugging face. Retrying. [{attempt}/{max_retries}]")
+        except (ConnectionError, ChunkedEncodingError) as e:
+            print(
+                f"Failed to connect to hugging face. Retrying. [{attempt}/{max_retries}]"
+            )
             if attempt == max_retries - 1:
                 raise e
             time.sleep(backoff * (attempt + 1))
+
+
+
+def _get_num_rows(src_path: str, name: str, split: str, retry: int = 3 ) -> int:
+    """
+    Utilise l'api hugging face pour approximer la taille
+    du dataset
+    """
+    url = f"https://datasets-server.huggingface.co/size?dataset={src_path}&config={name}"
+
+    for i in range(retry):
+        try:
+            response = requests.get(url).json()
+        except (ConnectionError, HTTPError) as e:
+            print("Error while trying to query dataset size :",repr(e))
+            print(f"Retrying [{i}/{retry}]")
+
+            if i + 1 == retry:
+                return random.randint(1000, int(1e6))
+            else:
+                continue
+
+    split_info = response["size"]["splits"]
+    for entry in split_info:
+        if entry["split"] == split:
+            return entry["num_rows"]
+
+    return response["size"]["dataset"]["num_bytes_memory"] // 4
+
 
 def get_tokens(
     it,
@@ -119,6 +167,9 @@ def get_tokens(
     else:
         print("Unexpected response:", example)
         return None
+
+
+# == Dataset ==
 
 
 class GPTDatasetV1(Dataset[tuple[Tensor, Tensor]]):
@@ -178,6 +229,7 @@ class GPTDatasetV2(Dataset):
 
 
 
+
 class GPTDatasetV3(IterableDataset):
     """
     Version du dataset tirant ses sources de hugging face.
@@ -206,54 +258,50 @@ class GPTDatasetV3(IterableDataset):
         self.seed = seed
         self.split = split
         self._length = 0
+        self.data = []
 
         # Estimation du nombre de tokens
         for src in self.sources:
-            print("Querying", src["path"], src["name"])
             ds = load_dataset(
                 src["path"],
                 src.get("name"),
                 split=self.split,
                 streaming=True,
             )
-            builder = ds.info.builder_name
-            num_examples = ds.info.splits["train"].num_examples
-            length = num_examples if builder == "parquet" else ds.dataset_size // 4
-            self._length += length
-
+            self.data.append(ds)
+            approx_length = _get_num_rows(src["path"], src["name"], split)
+            self._length += approx_length
 
     def __iter__(self) -> tuple[Tensor]:
         buffer = []
         eof_id = self.tokenizer._special_tokens["<|endoftext|>"]
-        iters = []
-        docs = 0
+        ended_stream = set()
+        stream_num = len(self.data)
+        round_num = 0
 
-        for src in self.sources:
-            print("Querying", src["path"], src["name"])
-            ds = load_dataset(
-                src["path"],
-                src.get("name"),
-                split=self.split,
-                streaming=True,
-            )
-            ds = ds.shuffle(buffer_size=10_000, seed=self.seed)
+        while len(ended_stream) < stream_num:
+            for idx, ds in enumerate(self.data):
 
-            iters.append((iter(ds), int(src.get("weight", 1))))
+                # Pour éviter d'obtenir meme docs a chaque fois
+                ds = ds.shuffle(buffer_size=1000, seed=self.seed + round_num)
+                weight = self.sources[idx]["weight"]
+                src = self.sources[idx]["path"]
+                it = iter(ds)
 
-        while iters:
-            next_iters = []
 
-            for it, weight in iters:
-                pulled = 0
+                for _ in range(weight):
 
-                while pulled < weight:
+
+
+
                     tokens = get_tokens(it, tokenizer=self.tokenizer, suffix=eof_id)
                     if tokens is None:
+                        ended_stream.add(src)
                         break
 
-                    pulled += 1
 
                     buffer.extend(tokens)
+
 
                     while len(buffer) >= self.ctx + 1:
                         x = torch.tensor(
@@ -268,13 +316,8 @@ class GPTDatasetV3(IterableDataset):
                         yield x, y
                         buffer = buffer[self.stride :]
 
-                else:
-                    docs += weight
-                    if docs % 500 == 0:
-                        print(f"[stream] {docs:,} docs")
-                    next_iters.append((it, weight))
-
-            iters = next_iters
+                del it
+                round_num += 1
 
     def __len__(self) -> int:
         return self._length
@@ -361,7 +404,7 @@ def create_dataloader_v3(
     tokenizer: Encoding,
     split: str,
     num_workers: int = 0,
-    prefetch_factor: int = 4,
+    prefetch_factor: int = 2,
     seed: int = 6,
 ) -> DataLoader:
 
@@ -515,13 +558,13 @@ TRAINING_PRESET_TEST = dict(
 
 TRAINING_PRESET_PROD = dict(
     model=GPTConfig(vocab_size=50257, drop_rate=0.1),
-    batch_size=2,
+    batch_size=4,
     grad_accum_steps=8,
-    num_epochs=5,  # Large dataset
-    eval_freq=2000,
-    num_batches=100,
+    num_epochs=2,  # Large dataset
+    eval_freq=1000,
+    num_batches=200,
     warmup_steps=2000,
-    lr=3e-4,
+    lr=2e-4,
 )
 # ------------------------ Monitor ------------------------------------------
 
@@ -1156,7 +1199,6 @@ def calc_loss_batch(
     )
     return loss
 
-
 def calc_loss_loader(
     data_loader: DataLoader, model: GPTModel, dev: device, num_batches: int = -1
 ) -> float:
@@ -1272,7 +1314,6 @@ def train_model(
         start_epoch = checkpoint["epoch"]
         best_train_loss = checkpoint["best_train_loss"]
         best_val_loss = checkpoint["best_val_loss"]
-        model._size()
         model.to(dev)
 
         print(f"Resumed from {resume_from} (epoch {start_epoch}, step {global_step})\n")
@@ -1516,7 +1557,8 @@ def load_checkpoint(filepath: Path, dev: device, config: GPTConfig) -> dict:
     optimizer.load_state_dict(checkpoint["optimizer"])
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer=optimizer, max_lr=optimizer.param_groups[0]["lr"]
+        optimizer=optimizer, max_lr=optimizer.param_groups[0]["lr"],
+        total_steps=1000
     )
     scheduler.load_state_dict(checkpoint["scheduler"])
 
@@ -1562,23 +1604,23 @@ def resume() -> None:
     dev = get_device(testing)
     max_length = tc.model.context_length
     stride = int(max_length * tc.stride_ratio)
-    num_workers = 2
+    num_workers = 1
 
     train_sources = [
         {
             "path": "HuggingFaceFW/fineweb-2",
             "name": "fra_Latn",
-            "weight": 5,
+            "weight": int((50 / 100)*10_000),
         },
         {
             "path": "HuggingFaceFW/fineweb-2",
             "name": "fon_Latn",
-            "weight": 2,
+            "weight": int((10 / 100)*10_000),
         },
         {
             "path": "dhlak/finewebedu-10b-gpt2-tokenized",
             "name": "default",
-            "weight": 4,
+            "weight": int((40 / 100)*10_000),
         },
     ]
 
@@ -1614,8 +1656,8 @@ def resume() -> None:
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}\n")
 
     if testing:
-        load_path = input(">>Spécifiez le chemin du fichier de sauvegarde: ")
-        load_path = Path(load_path)
+        inp = input(">>Spécifiez le chemin du fichier de sauvegarde: ")
+        load_path = Path(inp)
     else:
 
         load_path = Path(
@@ -1636,14 +1678,13 @@ def resume() -> None:
         dev=dev,
         tokenizer=tokenizer,
         model=model,
-        resume_from=load_path
+        resume_from=load_path,
     )
     monitor.close()
 
     final_path = WORK_DIR / "model_final.pt"
     torch.save(model.state_dict(), final_path)
     print(f"\nModel saved to {final_path}")
-
 
 
 def main():
@@ -1686,9 +1727,6 @@ def main():
 
     model._size()
 
-
-
-
     # ── Train ──
 
     monitor = Monitor()
@@ -1710,9 +1748,9 @@ def main():
     print(f"\nModel saved to {final_path}")
 
 
-
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--test", action="store_true", help="Quick sanity check with small config"

@@ -17,6 +17,7 @@ let
     pytest
     pip
     datasets
+    memory-profiler
   ];
 in
 pkgs.mkShell {

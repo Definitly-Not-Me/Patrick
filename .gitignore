@@ -27,3 +27,11 @@ _repro_rich*.ipynb
 _mk_repro_nb.py
 _sim_argparse.py
 _sim_kernel.py
+scratch.py
+
+# logs
+log
+log_OOM
+
+# secrets
+text/.env

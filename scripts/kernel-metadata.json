@@ -10,9 +10,7 @@
   "enable_internet": true,
   "machine_shape": "",
   "dataset_sources": [
-    "definitlynotme/llm-training-data",
-    "zhanglinghua011228/openwebtext",
-    "lokeshparab/gutenberg-books-and-metadata-2025"
+    "definitlynotme/llm-training-data"
   ],
   "competition_sources": [],
   "kernel_sources": [],

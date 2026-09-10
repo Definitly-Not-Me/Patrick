@@ -318,7 +318,7 @@ class GPTDatasetV3(IterableDataset):
 
                 del it
                 round_num += 1
-                print("Finished round :", round_num)
+                print("Finished serving round :", round_num)
 
     def __len__(self) -> int:
         return self._length
@@ -561,9 +561,9 @@ TRAINING_PRESET_PROD = dict(
     model=GPTConfig(vocab_size=50257, drop_rate=0.1),
     batch_size=4,
     grad_accum_steps=8,
-    num_epochs=2,  # Large dataset
-    eval_freq=125,
-    num_batches=200,
+    num_epochs=3,  # Large dataset
+    eval_freq=200,
+    num_batches=50,
     warmup_steps=2000,
     lr=2e-4,
 )
@@ -1344,7 +1344,7 @@ def train_model(
     # Nécessaire de le définir à l'intérieur pour simplifier la sauvegarde
 
     def _save_checkpoint(tag: str):
-        path = Path(save_dir)
+        path = Path(save_dir) / "model_checkpoint.pt"
         path = path.with_name(f"{path.stem}_{tag}{path.suffix}")
         path.parent.mkdir(exist_ok=True, parents=True)
 
@@ -1387,10 +1387,11 @@ def train_model(
                 tokens_seen += input_batch.numel()
                 accum_loss += loss.item()
 
-                ## Debugging
-                if i < 1000: print("Batch number :", i)
 
                 if should_step:
+                    ## Debugging
+                    if i < 1000: print("Stepping ... ", global_step)
+
                     global_step += 1
 
                     scaler.unscale_(optimizer)
@@ -1638,7 +1639,7 @@ def resume() -> None:
             "weight": int((10 / 100)*10_000),
         },
         {
-            "path": "dhlak/finewebedu-10b-gpt2-tokenized",
+            "path": "HuggingFaceFW/fineweb-edu",
             "name": "default",
             "weight": int((40 / 100)*10_000),
         },
@@ -1648,7 +1649,7 @@ def resume() -> None:
         {
             "path": "HuggingFaceFW/fineweb-2",
             "name": "fra_Latn",
-            "weight": 1,
+            "weight": 2000,
         },
     ]
 

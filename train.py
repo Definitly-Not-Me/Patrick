@@ -318,6 +318,7 @@ class GPTDatasetV3(IterableDataset):
 
                 del it
                 round_num += 1
+                print("Finished round :", round_num)
 
     def __len__(self) -> int:
         return self._length
@@ -561,7 +562,7 @@ TRAINING_PRESET_PROD = dict(
     batch_size=4,
     grad_accum_steps=8,
     num_epochs=2,  # Large dataset
-    eval_freq=1000,
+    eval_freq=125,
     num_batches=200,
     warmup_steps=2000,
     lr=2e-4,
@@ -1241,7 +1242,7 @@ def evaluate_model(
     val_loader: DataLoader,
     dev: device,
     num_batches: int,
-) -> tuple[float, float]:
+) -> float:
     """
     Compare la performance du model sur les données d'entraînement et ceux de
     validation
@@ -1255,11 +1256,12 @@ def evaluate_model(
     """
     model.eval()
     with torch.no_grad():
-        train_loss = calc_loss_loader(train_loader, model, dev, num_batches)
+        # Cause souvent OUT OF MEMORY sur des gros dataset
+        # train_loss = calc_loss_loader(train_loader, model, dev, num_batches)
         val_loss = calc_loss_loader(val_loader, model, dev, num_batches)
 
     model.train()
-    return train_loss, val_loss
+    return  val_loss
 
 
 def generate_and_print_sample(model, tokenizer, start_context, context_size, dev):
@@ -1299,6 +1301,9 @@ def train_model(
     best_val_loss = float("inf")
     best_train_loss = float("inf")
     loader_len = len(train_loader)
+    running_train_loss = 0.0
+    accum_loss = 0.0
+
     total_training_steps = loader_len * config.num_epochs
 
     csv_path = make_csv_path(Path(save_dir))
@@ -1380,6 +1385,10 @@ def train_model(
 
                 scaler.scale(loss).backward()
                 tokens_seen += input_batch.numel()
+                accum_loss += loss.item()
+
+                ## Debugging
+                if i < 1000: print("Batch number :", i)
 
                 if should_step:
                     global_step += 1
@@ -1405,12 +1414,22 @@ def train_model(
 
                     track_lrs.append(lr_now)
 
+                    running = accum_loss
+                    accum_loss = 0.0
+                    running_train_loss = (
+                    running
+                    if running_train_loss > 0
+                    else 0.95 * running_train_loss + 0.05 * running
+                    )
+
                     if global_step % config.eval_freq == 0:
                         example = config.example
 
                         torch.cuda.empty_cache()
 
-                        train_loss, val_loss = evaluate_model(
+                        train_loss = running_train_loss
+
+                        val_loss = evaluate_model(
                             model, train_loader, val_loader, dev, config.num_batches
                         )
                         train_losses.append(train_loss)
@@ -1477,6 +1496,7 @@ def train_model(
                         print(
                             f"  Epoch:      {epoch + 1}/{config.num_epochs} (step {global_step:,})"
                         )
+
 
             if len(train_loader) % config.grad_accum_steps != 0:
                 scaler.unscale_(optimizer)

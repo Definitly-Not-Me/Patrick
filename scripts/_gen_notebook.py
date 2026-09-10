@@ -104,7 +104,7 @@ cells.append(
         "outputs": [],
         "source": [
             "from train import resume\n",
-            "%mprun -f resume resume()"
+            "resume()"
         ],
     }
 )

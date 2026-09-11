@@ -22,7 +22,7 @@ from datasets import load_dataset
 from dotenv import load_dotenv
 from requests.exceptions import ConnectionError, ChunkedEncodingError, HTTPError
 import requests
-from memory_profiler  import profile
+from memory_profiler import profile
 
 # Base dir: notebook kernels don't define __file__, and src/ is absent there
 # anyway (train.py is fully self-contained), so this is only meaningful when
@@ -64,8 +64,10 @@ INPUT_DIR = _detect_input_dir()
 
 MB = 1024**2
 
+
 def _rss_mb() -> int:
     return psutil.Process(os.getpid()).memory_info().rss / MB
+
 
 def _perf(label: str, start: float):
     """Print elapsed time since `start` with a label."""
@@ -105,16 +107,13 @@ def safe_next(it, max_retries=3, backoff=2.0) -> dict | None:
         try:
             return next(it)
         except (ConnectionError, ChunkedEncodingError) as e:
-            print(
-                f"Failed to connect to hugging face. Retrying. [{attempt}/{max_retries}]"
-            )
+            print(f"Failed to connect to hugging face. Retrying. [{attempt}/{max_retries}]")
             if attempt == max_retries - 1:
                 raise e
             time.sleep(backoff * (attempt + 1))
 
 
-
-def _get_num_rows(src_path: str, name: str, split: str, retry: int = 3 ) -> int:
+def _get_num_rows(src_path: str, name: str, split: str, retry: int = 3) -> int:
     """
     Utilise l'api hugging face pour approximer la taille
     du dataset
@@ -125,7 +124,7 @@ def _get_num_rows(src_path: str, name: str, split: str, retry: int = 3 ) -> int:
         try:
             response = requests.get(url).json()
         except (ConnectionError, HTTPError) as e:
-            print("Error while trying to query dataset size :",repr(e))
+            print("Error while trying to query dataset size :", repr(e))
             print(f"Retrying [{i}/{retry}]")
 
             if i + 1 == retry:
@@ -228,8 +227,6 @@ class GPTDatasetV2(Dataset):
         return x, y
 
 
-
-
 class GPTDatasetV3(IterableDataset):
     """
     Version du dataset tirant ses sources de hugging face.
@@ -281,27 +278,19 @@ class GPTDatasetV3(IterableDataset):
 
         while len(ended_stream) < stream_num:
             for idx, ds in enumerate(self.data):
-
                 # Pour éviter d'obtenir meme docs a chaque fois
                 ds = ds.shuffle(buffer_size=1000, seed=self.seed + round_num)
                 weight = self.sources[idx]["weight"]
                 src = self.sources[idx]["path"]
                 it = iter(ds)
 
-
                 for _ in range(weight):
-
-
-
-
                     tokens = get_tokens(it, tokenizer=self.tokenizer, suffix=eof_id)
                     if tokens is None:
                         ended_stream.add(src)
                         break
 
-
                     buffer.extend(tokens)
-
 
                     while len(buffer) >= self.ctx + 1:
                         x = torch.tensor(
@@ -318,14 +307,13 @@ class GPTDatasetV3(IterableDataset):
 
                 del it
                 round_num += 1
-                print("Finished serving round :", round_num)
+                print(self.split.capitalize(), "Finished serving round :", round_num)
 
     def __len__(self) -> int:
         return self._length
 
-def create_dataloader_v1(
-    txt, batch_size, max_length, stride, shuffle=True, drop_last=True, num_workers=0
-):
+
+def create_dataloader_v1(txt, batch_size, max_length, stride, shuffle=True, drop_last=True, num_workers=0):
     # Initialize the tokenizer
     tokenizer = tiktoken.get_encoding("gpt2")
 
@@ -372,12 +360,8 @@ def create_dataloader_v2(
 
     split_idx = int(total_tokens * split)
 
-    train_ds = GPTDatasetV2(
-        bin_path, max_length=context_length, split_idx=(0, split_idx), stride=stride
-    )
-    val_ds = GPTDatasetV2(
-        bin_path, max_length=context_length, split_idx=(split_idx, -1), stride=stride
-    )
+    train_ds = GPTDatasetV2(bin_path, max_length=context_length, split_idx=(0, split_idx), stride=stride)
+    val_ds = GPTDatasetV2(bin_path, max_length=context_length, split_idx=(split_idx, -1), stride=stride)
 
     train_loader = DataLoader(
         train_ds,
@@ -465,15 +449,11 @@ GPT_XL = GPTConfig(embeddings_dim=1600, num_layers=48, num_heads=25)
 class TrainingConfig(BaseModel):
     """Hyperparamètres d'entraînement et de validation."""
 
-    model: GPTConfig = Field(
-        default_factory=GPTConfig, description="Architecture du modèle"
-    )
+    model: GPTConfig = Field(default_factory=GPTConfig, description="Architecture du modèle")
 
     # Data
     batch_size: int = Field(default=4, gt=0, description="Taille des mini-batches")
-    tokenizer_encoding: str = Field(
-        default="gpt2", description="Encodeur tiktoken à utiliser"
-    )
+    tokenizer_encoding: str = Field(default="gpt2", description="Encodeur tiktoken à utiliser")
     stride_ratio: float = Field(
         default=0.5,
         gt=0,
@@ -483,32 +463,16 @@ class TrainingConfig(BaseModel):
 
     # Training loop
     num_epochs: int = Field(default=10, gt=0, description="Nombre total d'époques")
-    lr: float = Field(
-        default=1e-4, gt=0, description="Taux d'apprentissage maximal (OneCycleLR)"
-    )
-    weight_decay: float = Field(
-        default=0.1, ge=0, description="Régularisation L2 du optimiseur AdamW"
-    )
-    warmup_steps: int = Field(
-        default=500, ge=0, description="Nombre d'étapes de warmup linéaire"
-    )
-    grad_accum_steps: int = Field(
-        default=1, gt=0, description="Nombre d'étapes d'accumulation de gradients"
-    )
-    max_grad_norm: float = Field(
-        default=1.0, gt=0, description="Valeur maximale du gradient pour le clipping"
-    )
-    final_div_factor: float = Field(
-        default=10.0, gt=0, description="Facteur de division finale du OneCycleLR"
-    )
+    lr: float = Field(default=1e-4, gt=0, description="Taux d'apprentissage maximal (OneCycleLR)")
+    weight_decay: float = Field(default=0.1, ge=0, description="Régularisation L2 du optimiseur AdamW")
+    warmup_steps: int = Field(default=500, ge=0, description="Nombre d'étapes de warmup linéaire")
+    grad_accum_steps: int = Field(default=1, gt=0, description="Nombre d'étapes d'accumulation de gradients")
+    max_grad_norm: float = Field(default=1.0, gt=0, description="Valeur maximale du gradient pour le clipping")
+    final_div_factor: float = Field(default=10.0, gt=0, description="Facteur de division finale du OneCycleLR")
 
     # Evaluation
-    eval_freq: int = Field(
-        default=100, gt=0, description="Fréquence d'évaluation (en nombre de steps)"
-    )
-    num_batches: int = Field(
-        default=-1, description="Nombre max de batches pour l'évaluation (-1 = tous)"
-    )
+    eval_freq: int = Field(default=100, gt=0, description="Fréquence d'évaluation (en nombre de steps)")
+    num_batches: int = Field(default=-1, description="Nombre max de batches pour l'évaluation (-1 = tous)")
     sample_length: int | None = Field(
         default=None,
         description="Longueur du texte généré pour l'exemple (None = context_length)",
@@ -529,9 +493,7 @@ class TrainingConfig(BaseModel):
     )
 
     # Misc
-    seed: int = Field(
-        default=8, description="Graine aléatoire pour la reproductibilité"
-    )
+    seed: int = Field(default=8, description="Graine aléatoire pour la reproductibilité")
 
     @property
     def example(self) -> str:
@@ -693,9 +655,7 @@ def generate_plots(csv_path: Path, output_dir: Path, hyperparams: dict):
         return
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(
-        data["step"], data["train_loss"], label="Train Loss", marker="o", markersize=3
-    )
+    ax.plot(data["step"], data["train_loss"], label="Train Loss", marker="o", markersize=3)
     ax.plot(data["step"], data["val_loss"], label="Val Loss", marker="s", markersize=3)
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
@@ -820,9 +780,7 @@ def build_memmap(
             written += len(ids) * 2
 
             if files_processed % 500 == 0:
-                print(
-                    f"  [{files_processed}] {file_path.name}: {len(ids):,} tokens (total: {total_tokens:,})"
-                )
+                print(f"  [{files_processed}] {file_path.name}: {len(ids):,} tokens (total: {total_tokens:,})")
 
     if total_tokens == 0:
         raise ValueError(f"No tokens produced from {input_dir}")
@@ -885,9 +843,7 @@ class Pytorch_MHA(nn.Module):
         else:
             attn_mask = self.mask[: self.context_length, : self.context_length]
 
-        heads_output, _ = self.multihead_attention(
-            x, x, x, attn_mask=attn_mask, need_weights=self.need_weights
-        )
+        heads_output, _ = self.multihead_attention(x, x, x, attn_mask=attn_mask, need_weights=self.need_weights)
 
         return heads_output
 
@@ -946,17 +902,7 @@ class GELU(nn.Module):
         super().__init__()
 
     def forward(self, x: Tensor) -> Tensor:
-        return (
-            0.5
-            * x
-            * (
-                1
-                + torch.tanh(
-                    torch.sqrt(torch.tensor(2.0 / torch.pi))
-                    * (x + 0.044715 * torch.pow(x, 3))
-                )
-            )
-        )
+        return 0.5 * x * (1 + torch.tanh(torch.sqrt(torch.tensor(2.0 / torch.pi)) * (x + 0.044715 * torch.pow(x, 3))))
 
 
 class SwiGLU(nn.Module):
@@ -1072,14 +1018,10 @@ class GPTModel(nn.Module):
         self.pos_emb = nn.Embedding(config.context_length, config.embeddings_dim)
 
         # Empile les transformers blocks
-        self.trans_blocks = nn.Sequential(
-            *[TransformerBlock(config) for _ in range(config.num_layers)]
-        )
+        self.trans_blocks = nn.Sequential(*[TransformerBlock(config) for _ in range(config.num_layers)])
 
         self.final_norm = RMSNorm(config.embeddings_dim)
-        self.output_head = nn.Linear(
-            config.embeddings_dim, config.vocab_size, bias=False
-        )
+        self.output_head = nn.Linear(config.embeddings_dim, config.vocab_size, bias=False)
         self.drop_emb = nn.Dropout(config.drop_rate)
         self.top_k = config.top_k
         self.temp = config.temperature
@@ -1102,12 +1044,8 @@ class GPTModel(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         print(f"Nombre total de parametre: {total_params:,}")
 
-        total_params_gpt2 = total_params - sum(
-            p.numel() for p in self.output_head.parameters()
-        )
-        print(
-            f"Nombre de paramètres entrainables en considérant le weight tying: {total_params_gpt2:,}"
-        )
+        total_params_gpt2 = total_params - sum(p.numel() for p in self.output_head.parameters())
+        print(f"Nombre de paramètres entrainables en considérant le weight tying: {total_params_gpt2:,}")
 
         # Calculate the total size in bytes (assuming float32, 4 bytes per parameter)
         total_size_bytes = total_params * 4
@@ -1187,22 +1125,17 @@ def tokensIds_to_text(tokens_ids: Tensor, tokenizer: Encoding) -> str:
     return tokenizer.decode(flat.tolist())
 
 
-def calc_loss_batch(
-    input_batch: Tensor, target_batch: Tensor, model: GPTModel, dev: device
-) -> Tensor:
+def calc_loss_batch(input_batch: Tensor, target_batch: Tensor, model: GPTModel, dev: device) -> Tensor:
     """
     Calcule la fonction de perte pour une configuration  model
     """
     input_batch, target_batch = input_batch.to(dev), target_batch.to(dev)
     logits = model(input_batch)
-    loss = torch.nn.functional.cross_entropy(
-        logits.flatten(0, 1), target_batch.flatten()
-    )
+    loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), target_batch.flatten())
     return loss
 
-def calc_loss_loader(
-    data_loader: DataLoader, model: GPTModel, dev: device, num_batches: int = -1
-) -> float:
+
+def calc_loss_loader(data_loader: DataLoader, model: GPTModel, dev: device, num_batches: int = -1) -> float:
     """
     Evalue le model sur un certain nombre d'examples du dataset
     Args:
@@ -1261,7 +1194,7 @@ def evaluate_model(
         val_loss = calc_loss_loader(val_loader, model, dev, num_batches)
 
     model.train()
-    return  val_loss
+    return val_loss
 
 
 def generate_and_print_sample(model, tokenizer, start_context, context_size, dev):
@@ -1269,9 +1202,7 @@ def generate_and_print_sample(model, tokenizer, start_context, context_size, dev
     eof = tokenizer._special_tokens.get("<|endoftext|>", None)
     encoded = text_to_tokens(start_context, tokenizer).to(dev)
     with autocast(device_type=dev.type, enabled=dev.type == "cuda"):
-        out = model.generate(
-            encoded, max_new_tokens=20, context_size=context_size, EOF_id=eof
-        )
+        out = model.generate(encoded, max_new_tokens=20, context_size=context_size, EOF_id=eof)
     print(tokensIds_to_text(out, tokenizer))
     model.train()
 
@@ -1314,7 +1245,6 @@ def train_model(
         model = checkpoint["model"]
         optimizer = checkpoint["optimizer"]
         scaler = checkpoint["scaler"]
-        scheduler = checkpoint["scheduler"]
         global_step = checkpoint["global_step"]
         start_epoch = checkpoint["epoch"]
         best_train_loss = checkpoint["best_train_loss"]
@@ -1324,22 +1254,21 @@ def train_model(
         print(f"Resumed from {resume_from} (epoch {start_epoch}, step {global_step})\n")
 
     else:
-
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=config.lr, weight_decay=config.weight_decay
-        )
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer=optimizer,
-            max_lr=optimizer.param_groups[0]["lr"],
-            total_steps=total_training_steps // config.grad_accum_steps,
-            epochs=config.num_epochs,
-            final_div_factor=config.final_div_factor,
-            pct_start=config.warmup_steps
-            / max(total_training_steps // config.grad_accum_steps, 1),
-        )
-
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
         scaler = GradScaler(enabled=dev.type == "cuda")
         start_epoch = 0
+
+    # Scheduler doit etre neuf pour chaque nouvelle entrainement
+    # Sans quoi le learning rate se comporte de maniere imprevisible
+    # eg: rester constant car total_step a ete atteint entrainement passe
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer=optimizer,
+        max_lr=optimizer.param_groups[0]["lr"],
+        total_steps=total_training_steps // config.grad_accum_steps,
+        epochs=config.num_epochs,
+        final_div_factor=config.final_div_factor,
+        pct_start=config.warmup_steps / max(total_training_steps // config.grad_accum_steps, 1),
+    )
 
     # Nécessaire de le définir à l'intérieur pour simplifier la sauvegarde
 
@@ -1369,37 +1298,29 @@ def train_model(
             optimizer.zero_grad()
 
             for i, (input_batch, target_batch) in enumerate(train_loader):
-                should_step = (i + 1) % config.grad_accum_steps == 0 or (
-                    i + 1
-                ) == loader_len
+                should_step = (i + 1) % config.grad_accum_steps == 0 or (i + 1) == loader_len
                 with autocast(device_type=dev.type, enabled=dev.type == "cuda"):
                     accumulation = min(
                         config.grad_accum_steps,
-                        loader_len
-                        - (i // config.grad_accum_steps) * config.grad_accum_steps,
+                        loader_len - (i // config.grad_accum_steps) * config.grad_accum_steps,
                     )
-                    loss = (
-                        calc_loss_batch(input_batch, target_batch, model, dev)
-                        / accumulation
-                    )
+                    loss = calc_loss_batch(input_batch, target_batch, model, dev) / accumulation
 
                 scaler.scale(loss).backward()
                 tokens_seen += input_batch.numel()
                 accum_loss += loss.item()
 
-
                 if should_step:
                     ## Debugging
-                    if i < 1000: print("Stepping ... ", global_step)
+                    if i < 1000:
+                        print("Stepping ... ", global_step)
 
                     global_step += 1
 
                     scaler.unscale_(optimizer)
 
                     grad_norm = (
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), max_norm=config.max_grad_norm
-                        )
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_grad_norm)
                         if global_step > config.warmup_steps
                         else 0.0
                     )
@@ -1411,17 +1332,13 @@ def train_model(
 
                     scheduler.step()
 
-                    lr_now = float(scheduler.get_last_lr()[0])
+                    lr_now = float(scheduler.get_last_lr()[-1])
 
                     track_lrs.append(lr_now)
 
                     running = accum_loss
                     accum_loss = 0.0
-                    running_train_loss = (
-                    running
-                    if running_train_loss > 0
-                    else 0.95 * running_train_loss + 0.05 * running
-                    )
+                    running_train_loss = running if running_train_loss > 0 else 0.95 * running_train_loss + 0.05 * running
 
                     if global_step % config.eval_freq == 0:
                         example = config.example
@@ -1430,9 +1347,7 @@ def train_model(
 
                         train_loss = running_train_loss
 
-                        val_loss = evaluate_model(
-                            model, train_loader, val_loader, dev, config.num_batches
-                        )
+                        val_loss = evaluate_model(model, train_loader, val_loader, dev, config.num_batches)
                         train_losses.append(train_loss)
                         val_losses.append(val_loss)
                         track_tokens.append(tokens_seen)
@@ -1445,7 +1360,6 @@ def train_model(
                             best_train_loss = train_loss
 
                         if monitor:
-
                             monitor.log(
                                 step=global_step,
                                 epoch=epoch + 1,
@@ -1453,13 +1367,11 @@ def train_model(
                                 val_loss=val_loss,
                                 lr=lr_now,
                                 grad_norm=float(grad_norm),
-                                tokens_per_sec=tokens_seen
-                                / (time.time() - monitor.start_time),
+                                tokens_per_sec=tokens_seen / (time.time() - monitor.start_time),
                                 tokens_seen=tokens_seen,
                             )
 
                         if csv_writer:
-
                             log_eval_row(
                                 csv_writer,
                                 step=global_step,
@@ -1474,9 +1386,7 @@ def train_model(
                             )
                             csv_file.flush()
 
-                        print(
-                            f"\n{'=' * 15} SAMPLE (step {global_step}, epoch {epoch + 1}) {'=' * 15}"
-                        )
+                        print(f"\n{'=' * 15} SAMPLE (step {global_step}, epoch {epoch + 1}) {'=' * 15}")
                         print(f"Input:  {example}\nOutput: ", end="")
 
                         generate_and_print_sample(
@@ -1488,22 +1398,16 @@ def train_model(
                         )
                         print("=" * 60)
 
+                        print(f"  Train Loss: {train_loss:.4f} (best: {best_train_loss:.4f})")
+                        print(f"  Val Loss:   {val_loss:.4f} (best: {best_val_loss:.4f})")
+                        print(f"  Epoch:      {epoch + 1}/{config.num_epochs} (step {global_step:,})")
                         print(
-                            f"  Train Loss: {train_loss:.4f} (best: {best_train_loss:.4f})"
+                            f" Learning rate: {lr_now}"
                         )
-                        print(
-                            f"  Val Loss:   {val_loss:.4f} (best: {best_val_loss:.4f})"
-                        )
-                        print(
-                            f"  Epoch:      {epoch + 1}/{config.num_epochs} (step {global_step:,})"
-                        )
-
 
             if len(train_loader) % config.grad_accum_steps != 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=config.max_grad_norm
-                )
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -1522,9 +1426,7 @@ def train_model(
 # --------------------- __main__ helpers -------------------------------------
 
 
-def _append_openwebtext(
-    train_loader: DataLoader, val_loader: DataLoader
-) -> tuple[DataLoader, DataLoader]:
+def _append_openwebtext(train_loader: DataLoader, val_loader: DataLoader) -> tuple[DataLoader, DataLoader]:
     """
     Petit Hack pour charger les données de openwebtext en plus de celles de
     présentes
@@ -1535,12 +1437,8 @@ def _append_openwebtext(
     if not candidates:
         raise FileNotFoundError("No openwebtext train.bin found under /kaggle/input")
     owt_dir = candidates[0].parent
-    owt_train = GPTDatasetV2(
-        owt_dir / "train.bin", max_length=ds.context_length, stride=ds.stride
-    )
-    owt_val = GPTDatasetV2(
-        owt_dir / "val.bin", max_length=ds.context_length, stride=ds.stride
-    )
+    owt_train = GPTDatasetV2(owt_dir / "train.bin", max_length=ds.context_length, stride=ds.stride)
+    owt_val = GPTDatasetV2(owt_dir / "val.bin", max_length=ds.context_length, stride=ds.stride)
 
     new_train_ds = ConcatDataset([train_loader.dataset, owt_train])
     new_val_ds = ConcatDataset([val_loader.dataset, owt_val])
@@ -1577,18 +1475,12 @@ def load_checkpoint(filepath: Path, dev: device, config: GPTConfig) -> dict:
     optimizer = torch.optim.AdamW(params=model.parameters())
     optimizer.load_state_dict(checkpoint["optimizer"])
 
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer=optimizer, max_lr=optimizer.param_groups[0]["lr"],
-        total_steps=1000
-    )
-    scheduler.load_state_dict(checkpoint["scheduler"])
 
     scaler.load_state_dict(checkpoint["scaler"])
 
     print("Successfully Loaded checkpoint from ", str(filepath))
 
     checkpoint["model"] = model
-    checkpoint["scheduler"] = scheduler
     checkpoint["optimizer"] = optimizer
     checkpoint["scaler"] = scaler
 
@@ -1629,19 +1521,19 @@ def resume() -> None:
 
     train_sources = [
         {
-            "path": "HuggingFaceFW/fineweb-2",
-            "name": "fra_Latn",
-            "weight": int((50 / 100)*10_000),
+            "path": "HuggingFaceFW/finewiki",
+            "name": "fr",
+            "weight": int((50 / 100) * 10_000),
         },
         {
             "path": "HuggingFaceFW/fineweb-2",
             "name": "fon_Latn",
-            "weight": int((10 / 100)*10_000),
+            "weight": int((10 / 100) * 10_000),
         },
         {
-            "path": "HuggingFaceFW/fineweb-edu",
-            "name": "default",
-            "weight": int((40 / 100)*10_000),
+            "path": "HuggingFaceFW/finewiki",
+            "name": "en",
+            "weight": int((40 / 100) * 10_000),
         },
     ]
 
@@ -1649,6 +1541,11 @@ def resume() -> None:
         {
             "path": "HuggingFaceFW/fineweb-2",
             "name": "fra_Latn",
+            "weight": 2000,
+        },
+        {
+            "path": "HuggingFaceFW/fineweb-edu",
+            "name": "default",
             "weight": 2000,
         },
     ]
@@ -1670,20 +1567,17 @@ def resume() -> None:
         context_length=max_length,
         stride=stride,
         num_workers=num_workers,
-        split="test",
+        split="train",           # Intentionnel, rares split "train" sur Hugging
         tokenizer=tokenizer,
     )
 
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}\n")
 
-    if testing:
+    if testing or not IS_KAGGLE:
         inp = input(">>Spécifiez le chemin du fichier de sauvegarde: ")
         load_path = Path(inp)
     else:
-
-        load_path = Path(
-            "../input/models/definitlynotme/patrick-gpt2/pytorch/default/1/model_checkpoint_best_model.pt"
-        )
+        load_path = Path("../input/models/definitlynotme/patrick-gpt2/pytorch/default/1/model_checkpoint_best_model.pt")
 
     model = GPTModel(tc.model).to(dev)
     model._size()
@@ -1773,12 +1667,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--test", action="store_true", help="Quick sanity check with small config"
-    )
-    parser.add_argument(
-        "--resume", type=str, default=None, help="Path to checkpoint to resume from"
-    )
+    parser.add_argument("--test", action="store_true", help="Quick sanity check with small config")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     # Notebook kernels don't have our CLI args in sys.argv (they carry the
     # kernel launcher's own args), so fall back to defaults there.
     if "__file__" in globals():

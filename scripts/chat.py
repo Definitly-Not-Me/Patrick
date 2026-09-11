@@ -3,7 +3,7 @@
 import argparse
 import sys
 from pathlib import Path
-
+import readline
 import torch
 from tiktoken import get_encoding
 

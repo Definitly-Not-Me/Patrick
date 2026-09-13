@@ -424,13 +424,16 @@ class GPTConfig(BaseModel):
 
     num_layers: int = Field(default=12)
     num_heads: int = Field(default=12, gt=1)
-    context_length: int = Field(default=1024, gt=0, multiple_of=2)
+    context_length: int = Field(default=4096, gt=0, multiple_of=2)
     embeddings_dim: int = Field(default=768, gt=0)
     drop_rate: float = Field(default=0.1, lt=1)
     qvk_bias: bool = Field(default=False)
     vocab_size: int = Field(default=50257)
     temperature: float = Field(default=0.8, gt=0)
     top_k: int = Field(default=40)
+    q_latent_dim:  int = Field(default=384, gt=0)
+    kv_latent_dim: int = Field(default=128, gt=0)
+    rope_dim:      int = Field(default=32, gt=0, multiple_of=2)
 
     @model_validator(mode="after")
     def validate_dimensions(self):
@@ -491,6 +494,8 @@ class TrainingConfig(BaseModel):
         ],
         description="Textes de départ pour la génération d'exemples. Choisi au hasard",
     )
+
+
 
     # Misc
     seed: int = Field(default=8, description="Graine aléatoire pour la reproductibilité")
@@ -802,6 +807,7 @@ def build_memmap(
 # --------------------------------- Model -----------------------------------
 
 
+
 class Pytorch_MHA(nn.Module):
     """
     Mécanisme d'attention optimisé avec Pytorch
@@ -941,44 +947,6 @@ class FeedForward(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.layers(x)
-
-
-class RoPE(nn.Module):
-    """
-    Rotationnary Positional Encoding
-    """
-
-    def __init__(self, max_seq_len: int, out_dim: int, base: float = 10_000.0) -> None:
-        super().__init__()
-
-        inverse_freq = 1.0 / (base ** (torch.arange(0, out_dim, 2).float() / out_dim))
-
-        positions = torch.arange(max_seq_len).float()
-
-        angles = positions[:, None] * inverse_freq[None, :]
-
-        self.register_buffer("cos", angles.cos())
-        self.register_buffer("sin", angles.sin())
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: [batch, heads, num_tokens, head_dim]
-        seq_len = x.shape[-2]
-
-        cos = self.cos[:seq_len]
-        sin = self.sin[:seq_len]
-
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
-
-        rotated_even = x_even * cos - sin * x_odd
-        rotated_odd = x_odd * cos + sin * x_even
-        # Interleave dimensions again
-        x_rotated = torch.empty_like(x)
-
-        x_rotated[..., 0::2] = rotated_even
-        x_rotated[..., 1::2] = rotated_odd
-
-        return x_rotated
 
 
 class TransformerBlock(nn.Module):
@@ -1285,7 +1253,6 @@ def train_model(
                 "epoch": epoch,
                 "best_val_loss": best_val_loss,
                 "best_train_loss": best_train_loss,
-                "scheduler": scheduler.state_dict(),
                 "scaler": scaler.state_dict(),
             },
             path,

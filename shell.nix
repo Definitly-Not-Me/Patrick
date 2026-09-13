@@ -18,6 +18,8 @@ let
     pip
     datasets
     memory-profiler
+    networkx
+    triton
   ];
 in
 pkgs.mkShell {
@@ -36,6 +38,7 @@ pkgs.mkShell {
     # Add .wakatime to PATH only if it isn't already there
     if ! echo "$PATH" | tr ':' '\n' | grep -qF "$HOME/.wakatime"; then
       export PATH="$HOME/.wakatime:$PATH"
+      echo "Wakatime-terminal added to path !"
     fi
 
      # Create venv if it doesn't exist

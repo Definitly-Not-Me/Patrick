@@ -17,7 +17,11 @@ source_lines = source.splitlines(keepends=True)
 # Strip the `if __name__ == "__main__": ...` guard so the definition cell
 # only defines things. Inside a notebook `__name__ == "__main__"`, so the guard
 # would auto-run training; instead we call resume() explicitly in its own cell.
-guardless = source_lines[: source_lines.index('if __name__ == "__main__":\n')]
+
+
+# guardless = source_lines[: source_lines.index('if __name__ == "__main__":\n')]
+
+guardless = source_lines
 guardless.insert(0, "%%file train.py\n")
 cells = []
 
@@ -42,8 +46,8 @@ cells.append(
         "source": [
             "!pip install --quiet torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121\n",
             "!pip install --quiet datasets python-dotenv tiktoken memory_profiler\n",
-            "!pip install memory_profiler -q\n",
-            "%load_ext memory_profiler"
+            "!pip install triton networkx\n",
+            "%load_ext memory_profiler",
         ],
     }
 )
@@ -81,7 +85,6 @@ cells.append(
         "metadata": {},
         "outputs": [],
         "source": guardless,
-
     }
 )
 
@@ -103,8 +106,7 @@ cells.append(
         "metadata": {},
         "outputs": [],
         "source": [
-            "from train import resume\n",
-            "resume()"
+            "%run train.py --input online\n",
         ],
     }
 )

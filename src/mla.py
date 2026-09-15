@@ -1,31 +1,8 @@
 from collections.abc import Iterator
-import os
-import sys
-import csv
-import psutil
-from datetime import datetime
-from pathlib import Path
-import gzip
-import json
-import random
-import time
-from time import perf_counter
 import torch
 from torch import Tensor, device, nn
-from torch.amp import GradScaler, autocast
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, IterableDataset
+from torch.amp import autocast
 from tiktoken import Encoding
-import tiktoken
-import hashlib
-import pickle
-import numpy as np
-from datasets import load_dataset
-from dotenv import load_dotenv
-from requests.exceptions import ConnectionError, ChunkedEncodingError, HTTPError
-import requests
-from memory_profiler import profile
-import torch
-from torch import Tensor, device, nn
 from pydantic import Field, BaseModel, model_validator
 
 
@@ -72,7 +49,7 @@ class GPTConfig(BaseModel):
         return self
 
 
-class TransformerBlock(nn.Module):
+class TransformerBlockV2(nn.Module):
     """
     Transformer block. Combine toutes les autres couches en un bloc cohérant
     """
@@ -123,14 +100,15 @@ class SwiGLU(nn.Module):
         return self.down(self.up(x) * nn.functional.silu(self.gate(x)))
 
 
-class GPTModel(nn.Module):
+
+class GPTModelV2(nn.Module):
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         self.tok_emb = nn.Embedding(config.vocab_size, config.embeddings_dim)
 
         # Empile les transformers blocks
         self.trans_blocks = nn.Sequential(
-            *[TransformerBlock(config) for _ in range(config.num_layers)]
+            *[TransformerBlockV2(config) for _ in range(config.num_layers)]
         )
 
         self.final_norm = RMSNorm(config.embeddings_dim)
@@ -151,7 +129,7 @@ class GPTModel(nn.Module):
         x = self.final_norm(x)
         logits = self.output_head(x)
 
-        return logits
+        return logits * torch.tanh(logits / 15.0)
 
     def _size(self) -> float:  # based on chapter code
 
@@ -261,7 +239,6 @@ class GPTModel(nn.Module):
                     print(f"Compiling module {name} of model ...")
                     module.compile()
 
-
 class Pytorch_MHA(nn.Module):
     """
     Mécanisme d'attention optimisé avec Pytorch
@@ -335,6 +312,7 @@ class RoPE(nn.Module):
         return x * cos + torch.cat([-x2, x1], dim=-1) * sin
 
 
+
 class MLAV1(nn.Module):
     """
     Multi-Head Latent attention avec RoPE
@@ -348,7 +326,7 @@ class MLAV1(nn.Module):
         self.dim_c = cfg.kv_latent_dim
         self.dim_r = cfg.rope_dim
 
-        self.rope = RoPE(dim=cfg.rope_dim, num_tokens=cfg.context_length)
+        self.rope = RoPE(dim=cfg.rope_dim, max_seq_len=cfg.context_length)
 
         # Query
         self.WD_Q = nn.Linear(cfg.embeddings_dim, cfg.q_latent_dim, bias=cfg.qvk_bias)
@@ -390,6 +368,11 @@ class MLAV1(nn.Module):
 
         # Absorbed Query and summary
         q_abs = self.W_QK(C_q).view(batch_size, num_tokens, self.num_heads, self.dim_c)
+
+        # Normalisation
+        nn.functional.rms_norm(q_abs, (self.dim_c,))
+        nn.functional.rms_norm(C_kv, (self.dim_c,))
+
         scores = torch.matmul(q_abs.transpose(1, 2), C_kv.transpose(-2, -1)[:, None])
 
         # Postional scores
@@ -397,6 +380,10 @@ class MLAV1(nn.Module):
             self.W_QR(C_q).view(batch_size, num_tokens, self.num_heads, self.dim_r),
             offset,
         )
+        # Normalisation
+        nn.functional.rms_norm(k_R, (self.dim_r,))
+        nn.functional.rms_norm(q_R, (self.dim_r,))
+
         scores = scores + torch.matmul(
             q_R.transpose(1, 2), k_R.transpose(-2, -1)[:, None]
         )
@@ -415,7 +402,6 @@ class MLAV1(nn.Module):
             scores = scores.masked_fill(~mask[:, None], float("-inf"))
 
         attn = scores.softmax(dim=-1)
-        am = attn.mean(1).detach()
         attn = self.attn_dropout(attn)
 
         values = self.WU_V(C_kv).view(
@@ -461,7 +447,6 @@ class MLAV1(nn.Module):
         )
 
         return self.Wo(out.view(1, 1, self.dim_heads * self.num_heads))
-
 
 class KVCache:
     """
@@ -541,7 +526,7 @@ def generate_and_print_sample(model, tokenizer, start_context, context_size, dev
     encoded = text_to_tokens(start_context, tokenizer).to(dev)
     with autocast(device_type=dev.type, enabled=dev.type == "cuda"):
         for tok in model.generate(encoded, max_new_tokens=20, context_size=context_size, EOF_id=eof):
-            print(tokensIds_to_text(out, tokenizer), end="")
+            print(tokensIds_to_text(out, tokenizer), end="", flush=True)
         print()
     model.train()
 

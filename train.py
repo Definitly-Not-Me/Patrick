@@ -1723,7 +1723,10 @@ def generate_and_print_sampleV2(model, tokenizer, start_context, context_size, d
 
 def load_checkpoint(filepath: Path, dev: device, config: GPTConfig) -> dict:
     with torch.device("meta"):
-        model = GPTModel(config)
+        if os.getenv("MODEL_VARIANT") == 1:
+            model = GPTModel(config)
+        else:
+            model = GPTModelV2(config)
         scaler = GradScaler(enabled=dev.type == "cuda")
 
     checkpoint = torch.load(filepath, map_location=dev, weights_only=False)
@@ -1830,7 +1833,7 @@ def train_model(
         start_epoch = checkpoint["epoch"]
         best_train_loss = checkpoint["best_train_loss"]
         best_val_loss = checkpoint["best_val_loss"]
-        model.to(dev)
+        model.to_empty(device=dev)
 
         print(f"Resumed from {resume_from} (epoch {start_epoch}, step {global_step})\n")
 
@@ -2306,8 +2309,10 @@ def entrypoint():
     match args.v:
         case 1:
             model = GPTModel(gptconf)
+            os.environ["MODEL_VARIANT"] = "1"
         case 2:
             model = GPTModelV2(gptconf)
+            os.environ["MODEL_VARIANT"] = "2"
         case _:
             print("Unknown Model version", args.v)
             exit(1)

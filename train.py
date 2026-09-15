@@ -18,7 +18,7 @@ import tiktoken
 import hashlib
 import pickle
 import numpy as np
-from datasets import load_dataset
+from datasets import load_dataset, interleave_datasets
 from dotenv import load_dotenv
 from requests.exceptions import ConnectionError, ChunkedEncodingError, HTTPError
 import requests
@@ -54,29 +54,29 @@ SOURCES = {
         {
             "path": "HuggingFaceFW/finewiki",
             "name": "fr",
-            "weight": int((50 / 100) * 10_000),
+            "weight": (50 / 100),
         },
         {
             "path": "HuggingFaceFW/fineweb-2",
             "name": "fon_Latn",
-            "weight": int((10 / 100) * 10_000),
+            "weight": (10 / 100),
         },
         {
             "path": "HuggingFaceFW/finewiki",
             "name": "en",
-            "weight": int((40 / 100) * 10_000),
+            "weight":  (40 / 100) ,
         },
     ],
     "val": [
         {
             "path": "HuggingFaceFW/fineweb-2",
             "name": "fra_Latn",
-            "weight": 2000,
+            "weight": 0.8,
         },
         {
             "path": "HuggingFaceFW/fineweb-edu",
             "name": "default",
-            "weight": 2000,
+            "weight": 0.2,
         },
     ],
 }
@@ -269,6 +269,7 @@ class GPTDatasetV2(Dataset):
         return x, y
 
 
+
 class GPTDatasetV3(IterableDataset):
     """
     Version du dataset tirant ses sources de hugging face.
@@ -287,72 +288,81 @@ class GPTDatasetV3(IterableDataset):
     ) -> None:
         """
         Args:
-            sources: list de dict de format [{"path": "chemin/dataset", "name": "nom_dossier", "weight": 10}, ...]
+            sources: list de dict de format [{"path": "chemin/dataset", "name": "nom_dossier", "weight": 0.8}, ...]
             weight: Combien de documents prendre de 'nom_dossier' par round
         """
         self.sources = sources
         self.tokenizer = tokenizer
         self.ctx = context_length
+
         self.stride = stride
         self.seed = seed
         self.split = split
         self._length = 0
-        self.data = []
+
+        assert 0 < self.stride <= self.ctx, f"stride must be in (0, ctx], got {self.stride}"
 
         # Estimation du nombre de tokens
         for src in self.sources:
-            ds = load_dataset(
-                src["path"],
-                src.get("name"),
-                split=self.split,
-                streaming=True,
-            )
-            self.data.append(ds)
             approx_length = _get_num_rows(src["path"], src["name"], split)
             self._length += approx_length
 
-    def __iter__(self) -> tuple[Tensor]:
+
+    def __iter__(self)-> Iterator[tuple[Tensor, Tensor]]:
         buffer = []
-        eof_id = self.tokenizer._special_tokens["<|endoftext|>"]
-        ended_stream = set()
-        stream_num = len(self.data)
-        round_num = 0
+        data = []
+        eof = self.tokenizer._special_tokens["<|endoftext|>"]
 
-        while len(ended_stream) < stream_num:
-            for idx, ds in enumerate(self.data):
-                # Pour éviter d'obtenir meme docs a chaque fois
-                ds = ds.shuffle(buffer_size=1000, seed=self.seed + round_num)
-                weight = self.sources[idx]["weight"]
-                src = self.sources[idx]["path"]
-                it = iter(ds)
+        for src in self.sources:
+            print("Querying Dataset ", src["name"])
+            ds = load_dataset(
+                src["path"],
+                name=src["name"],
+                streaming=True,
+                split=self.split
+            )
+            data.append(ds)
 
-                for _ in range(weight):
-                    tokens = get_tokens(it, tokenizer=self.tokenizer, suffix=eof_id)
-                    if tokens is None:
-                        ended_stream.add(src)
-                        break
+        mixed_dataset = interleave_datasets(
+            data,
+            probabilities=[src["weight"] for src in self.sources],
+            seed = self.seed,
+        )
+        mixed_dataset.shuffle(buffer_size=10_000)
 
-                    buffer.extend(tokens)
+        for sample in mixed_dataset:
+            if sample.get("text"):
+                tokens = self.tokenizer.encode(sample["text"])
+                tokens.append(eof)
+            elif sample.get("input_ids"):
+                ids =  sample.get("inputs_ids")
+                tokens = ids if isinstance(ids, list) else [ids]
 
-                    while len(buffer) >= self.ctx + 1:
-                        x = torch.tensor(
-                            buffer[: self.ctx],
-                            dtype=torch.long,
-                        )
-                        y = torch.tensor(
-                            buffer[1 : self.ctx + 1],
-                            dtype=torch.long,
-                        )
+            else:
+                print("Unknown response received", sample)
+                tokens = None
+                continue
 
-                        yield x, y
-                        buffer = buffer[self.stride :]
+            if tokens is None:
+                continue
 
-                del it
-                round_num += 1
-                print(self.split.capitalize(), "Finished serving round :", round_num)
-    def __len__(self) -> int:
+            buffer.extend(tokens)
+
+            while len(buffer) >= self.ctx + 1:
+                x = torch.tensor(
+                    buffer[: self.ctx],
+                    dtype=torch.long,
+                )
+                y = torch.tensor(
+                    buffer[1 : self.ctx + 1],
+                    dtype=torch.long,
+                )
+
+                yield x, y
+                buffer = buffer[self.stride :]
+
+    def __len__(self)-> int:
         return self._length
-
 
 def create_dataloader_v1(
     txt, batch_size, max_length, stride, shuffle=True, drop_last=True, num_workers=0
@@ -481,6 +491,7 @@ class GPTConfig(BaseModel):
     q_latent_dim: int = Field(default=384, gt=0)
     kv_latent_dim: int = Field(default=128, gt=0)
     rope_dim: int = Field(default=32, gt=0, multiple_of=2)
+    table_size: int = Field(default=2, gt=0)
 
     @model_validator(mode="after")
     def validate_dimensions(self):
@@ -593,7 +604,7 @@ TRAINING_PRESET_TEST = dict(
 
 # Pour l'environement de Kaggle
 TRAINING_PRESET_PROD = dict(
-    model=GPTConfig(vocab_size=50257, drop_rate=0.1, context_length=1024),
+    model=GPTConfig(vocab_size=50257, drop_rate=0.1, context_length=512),
     batch_size=4,
     grad_accum_steps=16,
     num_epochs=3,  # Large dataset
@@ -876,6 +887,28 @@ def build_memmap(
 # --------------------------------- Model -----------------------------------
 
 
+def get_bigram_hash(x: Tensor, table_size: int) -> Tensor:
+    """
+    Calcul le hash de chaque bigram d'une sequence
+    Args:
+        x: Tenseur (B, T)
+    Returns: (B, T) table des indices
+    """
+    rand_int_1 = int(2**32 - 1)
+    rand_int_2 = 2147483623
+
+    mod = table_size - 1
+
+    x = x.to(torch.int64).clone()
+    x[:, 0] = mod
+    x[:, 1:] = torch.bitwise_xor(
+        rand_int_1 * x[:, 1:],
+        rand_int_2 * x[:, :-1]
+    ) % mod
+
+    return x
+
+
 class GPTModelV2(nn.Module):
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
@@ -885,6 +918,15 @@ class GPTModelV2(nn.Module):
         self.trans_blocks = nn.Sequential(
             *[TransformerBlockV2(config) for _ in range(config.num_layers)]
         )
+
+        # Engram
+        self.bigram_embed = nn.Embedding(config.table_size * config.vocab_size,config.embeddings_dim // 2, dtype=torch.float32)
+        self.bigram_proj = nn.Linear(config.embeddings_dim // 2, config.embeddings_dim)
+        nn.init.zeros_(self.bigram_embed.weight)
+        nn.init.zeros_(self.bigram_proj.weight)
+        self.x0_lambdas = nn.Parameter(torch.zeros(config.num_layers))       # unigram re-injection gate
+        self.bigram_lambdas = nn.Parameter(0.1 * torch.ones(config.num_layers))  # bigram gate
+
 
         self.final_norm = RMSNorm(config.embeddings_dim)
         self.output_head = nn.Linear(
@@ -897,9 +939,16 @@ class GPTModelV2(nn.Module):
 
     def forward(self, input_idx: Tensor) -> Tensor:
         batch_size, seq_len = input_idx.shape
-        x = self.tok_emb(input_idx)
+        x0 = self.tok_emb(input_idx)
+        x0 = nn.functional.rms_norm(x0, (self.cfg.embeddings_dim,))
+        x = self.drop_emb(x0)
+        bigram_idx = get_bigram_hash(input_idx, self.bigram_embed.num_embeddings)
+        x0_bigram = self.bigram_proj(self.bigram_embed(bigram_idx))
 
-        x = self.drop_emb(x)
+        for i, block in enumerate(self.trans_blocks):
+            x = x + self.x0_lambdas[i] * x0 + self.bigram_lambdas[i] * x0_bigram
+            x = block(x)
+
         x = self.trans_blocks(x)
         x = self.final_norm(x)
         logits = self.output_head(x)
@@ -944,8 +993,12 @@ class GPTModelV2(nn.Module):
            next_id: l'id du prochain token
         """
         assert input.size(0) == 1, "Inference needs batch size = 1."
+
         prompt = input[0].tolist()
         prompt_len = len(prompt)
+
+        assert prompt_len != 0, "Prompt should not be empty"
+
         max_new_tokens = min(max_new_tokens, context_size - prompt_len)
         total = prompt_len + max_new_tokens
         device = next(self.parameters()).device
@@ -1014,7 +1067,6 @@ class GPTModelV2(nn.Module):
                     print(f"Compiling module {name} of model ...")
                     module.compile()
 
-
 class TransformerBlockV2(nn.Module):
     """
     Transformer block. Combine toutes les autres couches en un bloc cohérant
@@ -1079,9 +1131,11 @@ class KVCache:
         return self.len
 
 
+
+
 class MLAV1(nn.Module):
     """
-    Multi-Head Latent attention avec RoPE
+    Multi-Head Latent attention avec RoPE, XSA
     """
 
     def __init__(self, cfg: GPTConfig) -> None:
@@ -1172,8 +1226,14 @@ class MLAV1(nn.Module):
 
         values = self.WU_V(C_kv).view(
             batch_size, num_tokens, self.num_heads, self.dim_heads
-        )
+                )
+
+        # Orthogonal projection (XSA)
+
         output = torch.matmul(attn, values.transpose(1, 2)).transpose(1, 2).contiguous()
+
+        v_n = nn.functional.normalize(values, dim=-1)
+        output = output - (output * v_n).sum(dim=-1, keepdim=True) * v_n
 
         return self.Wo(
             output.view(batch_size, num_tokens, self.num_heads * self.dim_heads)
@@ -1200,11 +1260,23 @@ class MLAV1(nn.Module):
             self.W_QR(C_q).view(1, 1, self.num_heads, self.dim_r), pos
         ).view(self.num_heads, self.dim_r)
 
-        # Caching mechanism
-        cache.append(self.WD_KV(x)[0, 0], self.rope(self.W_KR(x), pos)[0, 0])
+
+        # Normalisation
+        q_abs = nn.functional.rms_norm(q_abs, (self.dim_c,))
+        q_R = nn.functional.rms_norm(q_R, (self.dim_r,))
+        k_c = nn.functional.rms_norm(self.WD_KV(X)[0, 0], (self.dim_c,))
+        k_r =  nn.functional.rms_norm(self.rope(self.W_KR(x), pos)[0, 0], (self.dim_r,))
+
+        # Caching Mechanism
+        cache.append(k_c, k_r)
 
         C_all, R_all = cache.C(), cache.R()
-        attn = (q_abs @ C_all.T + q_R @ R_all.T).mul(self.scale).softmax(-1)
+
+        attn = (q_abs @ C_all.T + q_R @ R_all.T).mul(self.scale)
+
+        # XSA
+        attn[:, -1] = float("-inf")
+        attn = attn.softmax(dim=-1)
 
         C_bar = attn @ C_all
         out = torch.bmm(
@@ -1213,7 +1285,6 @@ class MLAV1(nn.Module):
         )
 
         return self.Wo(out.view(1, 1, self.dim_heads * self.num_heads))
-
 
 
 class RoPE(nn.Module):

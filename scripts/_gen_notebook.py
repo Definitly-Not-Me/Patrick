@@ -106,7 +106,7 @@ cells.append(
         "metadata": {},
         "outputs": [],
         "source": [
-            "%run train.py --input online\n",
+            "%run train.py --input online --resume-from  /kaggle/input/models/definitlynotme/patrick-gpt2/pytorch/default/3/model_checkpoint_best_model.pt\n",
         ],
     }
 )

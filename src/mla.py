@@ -41,6 +41,7 @@ class GPTConfig(BaseModel):
     q_latent_dim: int = Field(default=512, gt=0)
     kv_latent_dim: int = Field(default=256, gt=0)
     rope_dim: int = Field(default=32, gt=0, multiple_of=2)
+    table_size: int = Field(default=2, gt=0)
 
     @model_validator(mode="after")
     def validate_dimensions(self):
@@ -111,6 +112,15 @@ class GPTModelV2(nn.Module):
             *[TransformerBlockV2(config) for _ in range(config.num_layers)]
         )
 
+        # Engram
+        self.bigram_embed = nn.Embedding(config.table_size * config.vocab_size,config.embeddings_dim // 2, dtype=torch.float32)
+        self.bigram_proj = nn.Linear(config.embeddings_dim // 2, config.embeddings_dim)
+        nn.init.zeros_(self.bigram_embed.weight)
+        nn.init.zeros_(self.bigram_proj.weight)
+        self.x0_lambdas = nn.Parameter(torch.zeros(config.num_layers))       # unigram re-injection gate
+        self.bigram_lambdas = nn.Parameter(0.1 * torch.ones(config.num_layers))  # bigram gate
+
+
         self.final_norm = RMSNorm(config.embeddings_dim)
         self.output_head = nn.Linear(
             config.embeddings_dim, config.vocab_size, bias=False
@@ -122,9 +132,16 @@ class GPTModelV2(nn.Module):
 
     def forward(self, input_idx: Tensor) -> Tensor:
         batch_size, seq_len = input_idx.shape
-        x = self.tok_emb(input_idx)
+        x0 = self.tok_emb(input_idx)
+        x0 = nn.functional.rms_norm(x0, (self.cfg.embeddings_dim,))
+        x = self.drop_emb(x0)
+        bigram_idx = get_bigram_hash(input_idx, self.bigram_embed.num_embeddings)
+        x0_bigram = self.bigram_proj(self.bigram_embed(bigram_idx))
 
-        x = self.drop_emb(x)
+        for i, block in enumerate(self.trans_blocks):
+            x = x + self.x0_lambdas[i] * x0 + self.bigram_lambdas[i] * x0_bigram
+            x = block(x)
+
         x = self.trans_blocks(x)
         x = self.final_norm(x)
         logits = self.output_head(x)
@@ -169,8 +186,12 @@ class GPTModelV2(nn.Module):
            next_id: l'id du prochain token
         """
         assert input.size(0) == 1, "Inference needs batch size = 1."
+
         prompt = input[0].tolist()
         prompt_len = len(prompt)
+
+        assert prompt_len != 0, "Prompt should not be empty"
+
         max_new_tokens = min(max_new_tokens, context_size - prompt_len)
         total = prompt_len + max_new_tokens
         device = next(self.parameters()).device
@@ -290,11 +311,11 @@ class Pytorch_MHA(nn.Module):
 class RoPE(nn.Module):
     """Rotational Positional Embedding"""
 
-    def __init__(self, dim: int, num_tokens: int, base: float = 10_000.0) -> None:
+    def __init__(self, dim: int, max_seq_len: int, base: float = 10_000.0) -> None:
         super().__init__()
         assert dim % 2 == 0
         inv = base ** (-torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-        angle = torch.outer(torch.arange(num_tokens, dtype=torch.float32), inv)
+        angle = torch.outer(torch.arange(max_seq_len, dtype=torch.float32), inv)
         embeddings = torch.cat([angle, angle], dim=-1)
         self.register_buffer(
             "cos", embeddings.cos(), persistent=False
@@ -315,7 +336,7 @@ class RoPE(nn.Module):
 
 class MLAV1(nn.Module):
     """
-    Multi-Head Latent attention avec RoPE
+    Multi-Head Latent attention avec RoPE, XSA
     """
 
     def __init__(self, cfg: GPTConfig) -> None:
@@ -406,8 +427,14 @@ class MLAV1(nn.Module):
 
         values = self.WU_V(C_kv).view(
             batch_size, num_tokens, self.num_heads, self.dim_heads
-        )
+                )
+
+        # Orthogonal projection (XSA)
+
         output = torch.matmul(attn, values.transpose(1, 2)).transpose(1, 2).contiguous()
+
+        v_n = nn.functional.normalize(values, dim=-1)
+        output = output - (output * v_n).sum(dim=-1, keepdim=True) * v_n
 
         return self.Wo(
             output.view(batch_size, num_tokens, self.num_heads * self.dim_heads)
@@ -434,11 +461,23 @@ class MLAV1(nn.Module):
             self.W_QR(C_q).view(1, 1, self.num_heads, self.dim_r), pos
         ).view(self.num_heads, self.dim_r)
 
-        # Caching mechanism
-        cache.append(self.WD_KV(x)[0, 0], self.rope(self.W_KR(x), pos)[0, 0])
+
+        # Normalisation
+        q_abs = nn.functional.rms_norm(q_abs, (self.dim_c,))
+        q_R = nn.functional.rms_norm(q_R, (self.dim_r,))
+        k_c = nn.functional.rms_norm(self.WD_KV(X)[0, 0], (self.dim_c,))
+        k_r =  nn.functional.rms_norm(self.rope(self.W_KR(x), pos)[0, 0], (self.dim_r,))
+
+        # Caching Mechanism
+        cache.append(k_c, k_r)
 
         C_all, R_all = cache.C(), cache.R()
-        attn = (q_abs @ C_all.T + q_R @ R_all.T).mul(self.scale).softmax(-1)
+
+        attn = (q_abs @ C_all.T + q_R @ R_all.T).mul(self.scale)
+
+        # XSA
+        attn[:, -1] = float("-inf")
+        attn = attn.softmax(dim=-1)
 
         C_bar = attn @ C_all
         out = torch.bmm(
@@ -530,35 +569,26 @@ def generate_and_print_sample(model, tokenizer, start_context, context_size, dev
         print()
     model.train()
 
-class LightningIndexer(nn.Module):
-    """Inspiré par architecture de deepseek"""
+def get_bigram_hash(x: Tensor, table_size: int) -> Tensor:
+    """
+    Calcul le hash de chaque bigram d'une sequence
+    Args:
+        x: Tenseur (B, T)
+    Returns: (B, T) table des indices
+    """
+    rand_int_1 = 91
+    rand_int_2 = 5
 
-    def __init__(self, cfg: GPTConfig, rope: RoPE) -> None:
-        super().__init__()
-        self.num_heads = cfg.indexer_heads
-        self.dim_I = cfg.indexer_head_dim
-        self.W_QI = nn.Linear(
-            cfg.embeddings_dim, self.num_heads * self.dim_I, bias=cfg.qvk_bias
-        )
-        self.W_KI = nn.Linear(cfg.embeddings_dim, self.dim_I, bias=cfg.qvk_bias)
-        self.w = nn.Linear(self.dim_I, 1, bias=False)
-        self.rope = rope
+    mod = table_size - 1
 
-    def forward(self, x, offset=0):
-        batch_size, num_tokens, _ = x.shape
+    x = x.to(torch.int64).clone()
+    x[:, 0] = mod
+    x[:, 1:] = torch.bitwise_xor(
+        rand_int_1 * x[:, 1:],
+        rand_int_2 * x[:, :-1]
+    ) % mod
 
-        q = self.rope(
-            self.W_QI(x).view(batch_size, num_tokens, self.num_heads, self.dim_I),
-            offset,
-        )
-        k = self.rope(self.W_KI(x)[:, :, None, :], offset).squeeze(2)
-        grades = torch.relu(
-            torch.matmul(q.transpose(1, 2), k[:, None].transpose(-2, -1))
-        )
-        w = self.w(q)
-
-        return (w.transpose(1, 2) * grades).sum(1)
-
+    return x
 
 def shape_contract(m, cfg):
     d, H = cfg.embeddings_dim, cfg.num_heads
@@ -597,9 +627,7 @@ if __name__ == "__main__":
     )
     stepped = torch.cat([block.step(X[:, t : t + 1], cache, t) for t in range(8)], 1)
     print(torch.allclose(stepped, full, atol=1e-4))  # True → delete this script
-    scout = LightningIndexer(cfg, rope=block.rope)
-    print(scout(torch.randn(2, 16, 768)).shape)  # expect (2, 16, 16)
-    print("Scout :", sum(p.numel() for p in scout.parameters()))
-    out = block(X)
-    (out.sum() + block.last_aux).backward()
-    block.eval()  # dropout off — equality tests need determinism
+    x = torch.randint(0, 50257, (1, 2048))
+    idx = get_bigram_hash(x, 100514)
+    assert idx.min() >= 0
+    assert idx.max() < 100514  # ← this is what was failing

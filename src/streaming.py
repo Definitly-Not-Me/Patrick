@@ -1,6 +1,6 @@
 import os
 import psutil
-from datasets import load_dataset
+from datasets import load_dataset, interleave_datasets
 from torch.utils.data import IterableDataset, DataLoader
 from tiktoken import Encoding
 from torch import Tensor
@@ -11,6 +11,8 @@ import time
 from requests.exceptions import ConnectionError, ChunkedEncodingError, HTTPError
 import requests
 import random
+from memory_profiler import profile
+from collections.abc import Iterator
 
 MB = 1024**2
 
@@ -86,6 +88,9 @@ def get_tokens(
         return None
 
 
+
+
+
 class GPTDatasetV3(IterableDataset):
     """
     Version du dataset tirant ses sources de hugging face.
@@ -110,80 +115,74 @@ class GPTDatasetV3(IterableDataset):
         self.sources = sources
         self.tokenizer = tokenizer
         self.ctx = context_length
+
         self.stride = stride
         self.seed = seed
         self.split = split
         self._length = 0
-        self.data = []
+
+        assert 0 < self.stride <= self.ctx, f"stride must be in (0, ctx], got {self.stride}"
 
         # Estimation du nombre de tokens
         for src in self.sources:
-            print("Querying", src["path"], src["name"])
-            ds = load_dataset(
-                src["path"],
-                src.get("name"),
-                split=self.split,
-                streaming=True,
-            )
-            print(f"Received dataset {ds} from {src['name']}")
-            self.data.append(ds)
             approx_length = _get_num_rows(src["path"], src["name"], split)
             self._length += approx_length
 
-    def __iter__(self) -> tuple[Tensor]:
+
+    def __iter__(self)-> Iterator[tuple[Tensor, Tensor]]:
         buffer = []
-        eof_id = self.tokenizer._special_tokens["<|endoftext|>"]
-        ended_stream = set()
-        stream_num = len(self.data)
-        round_num = 0
+        data = []
+        eof = self.tokenizer._special_tokens["<|endoftext|>"]
 
-        while len(ended_stream) < stream_num:
-            for idx, ds in enumerate(self.data):
+        for src in self.sources:
+            print("Querying Dataset ", src["name"])
+            ds = load_dataset(
+                src["path"],
+                name=src["name"],
+                streaming=True,
+                split=self.split
+            )
+            data.append(ds)
 
-                # Pour éviter d'obtenir meme docs a chaque fois
-                ds = ds.shuffle(buffer_size=1000, seed=self.seed + round_num)
-                weight = self.sources[idx]["weight"]
-                src = self.sources[idx]["path"]
-                it = iter(ds)
+        mixed_dataset = interleave_datasets(
+            data,
+            probabilities=[src["weight"] for src in self.sources],
+            seed = self.seed,
+        )
+        mixed_dataset.shuffle(buffer_size=10_000)
 
-                print(f"Start: {_rss_mb():.2f} MB")
+        for sample in mixed_dataset:
+            if sample.get("text"):
+                tokens = self.tokenizer.encode(sample["text"])
+                tokens.append(eof)
+            elif sample.get("input_ids"):
+                ids =  sample.get("inputs_ids")
+                tokens = ids if isinstance(ids, list) else [ids]
 
-                for _ in range(weight):
+            else:
+                print("Unknown response received", sample)
+                tokens = None
+                continue
 
+            if tokens is None:
+                continue
 
-                    print("### PULLING FROM: ", src, "###")
+            buffer.extend(tokens)
 
+            while len(buffer) >= self.ctx + 1:
+                x = torch.tensor(
+                    buffer[: self.ctx],
+                    dtype=torch.long,
+                )
+                y = torch.tensor(
+                    buffer[1 : self.ctx + 1],
+                    dtype=torch.long,
+                )
 
-                    print(f"Before tokenization : {_rss_mb():.2f}")
-                    tokens = get_tokens(it, tokenizer=self.tokenizer, suffix=eof_id)
-                    print(f"After tokenization: {_rss_mb():.2f}")
-                    if tokens is None:
-                        ended_stream.add(src)
-                        break
+                yield x, y
+                buffer = buffer[self.stride :]
 
-
-                    buffer.extend(tokens)
-
-                    print(f"RSS: {_rss_mb():.2f} MB  | Buffer: {len(buffer)}")
-
-                    while len(buffer) >= self.ctx + 1:
-                        x = torch.tensor(
-                            buffer[: self.ctx],
-                            dtype=torch.long,
-                        )
-                        y = torch.tensor(
-                            buffer[1 : self.ctx + 1],
-                            dtype=torch.long,
-                        )
-
-                        yield x, y
-                        buffer = buffer[self.stride :]
-
-                del it
-                round_num += 1
-                print(f"End : {_rss_mb():.2f} MB")
-
-    def __len__(self) -> int:
+    def __len__(self)-> int:
         return self._length
 
 
@@ -193,18 +192,18 @@ def main() -> None:
         {
             "path": "HuggingFaceFW/fineweb-2",
             "name": "fra_Latn",
-            "weight": 1,
+            "weight": 0.5,
         },
         {
             "path": "HuggingFaceFW/fineweb",
             "name": "CC-MAIN-2024-10",
-            "weight": 1,
+            "weight": 0.3,
         },
-        # {
-        #     "path": "dhlak/finewebedu-10b-gpt2-tokenized",
-        #     "name": "default",
-        #     "weight": 1,
-        # },
+        {
+            "path": "dhlak/finewebedu-10b-gpt2-tokenized",
+            "name": "default",
+            "weight": 0.2,
+        },
     ]
     tokenizer = tiktoken.get_encoding("gpt2")
     dataset = GPTDatasetV3(sources=sources, context_length=1024, stride=512, tokenizer=tokenizer, seed=15, split="train")

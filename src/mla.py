@@ -6,6 +6,39 @@ from tiktoken import Encoding
 from pydantic import Field, BaseModel, model_validator
 
 
+class KVCache:
+    """
+    KV caching pour optimiser la vitesse
+    d'inférence
+    """
+
+    def __init__(
+        self,
+        max_len: int,
+        dim_c: int,
+        dim_R: int,
+        dev: device,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        self.C_buf = torch.zeros(max_len, dim_c, device=dev, dtype=dtype)
+
+        self.R_buf = torch.zeros(max_len, dim_R, device=dev, dtype=dtype)
+        self.len = 0
+
+    def append(self, c, r):
+        self.C_buf[self.len] = c
+        self.R_buf[self.len] = r
+        self.len += 1
+
+    def C(self) -> Tensor:
+        return self.C_buf[: self.len]
+
+    def R(self) -> Tensor:
+        return self.R_buf[: self.len]
+
+    def __len__(self) -> int:
+        return self.len
+
 class RMSNorm(nn.Module):
     """
     Couche de normalisation semblable a LayerNorm a la difference
@@ -57,15 +90,15 @@ class TransformerBlockV2(nn.Module):
 
     def __init__(self, config: GPTConfig):
         super().__init__()
-        self.attention = MLAV1(GPTConfig())
+        self.attention = MLAV1(config)
 
         self.ffwd: SwiGLU = SwiGLU(config.embeddings_dim)
         self.norm1: RMSNorm = RMSNorm(config.embeddings_dim)
         self.norm2: RMSNorm = RMSNorm(config.embeddings_dim)
         self.dropout: nn.Dropout = nn.Dropout(config.drop_rate)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x_attn = self.attention(self.norm1(x))
+    def forward(self, x: Tensor, cache: KVCache, offset: int = 0) -> Tensor:
+        x_attn = self.attention(self.norm1(x), cache=cache, offset=offset)
         x_ffwd = self.ffwd(self.norm2(x))
 
         return x + self.dropout(x_attn) + self.dropout(x_ffwd)
@@ -74,6 +107,7 @@ class TransformerBlockV2(nn.Module):
         """
         Equivalent de forward() optimisé pour l'inférence
         """
+        # x = x + self.x0_lambdas[layer_idx] * x0 + self.bigram_lambdas[layer_idx] * x0_bigram
         x_attn = self.attention.step(self.norm1(x), cache, pos)
         x_ffwd = +self.ffwd(self.norm2(x))
 
@@ -130,7 +164,7 @@ class GPTModelV2(nn.Module):
         self.temp = config.temperature
         self.cfg = config
 
-    def forward(self, input_idx: Tensor) -> Tensor:
+    def forward(self, input_idx: Tensor, cache: KVCache = None, offset: int = 0) -> Tensor:
         batch_size, seq_len = input_idx.shape
         x0 = self.tok_emb(input_idx)
         x0 = nn.functional.rms_norm(x0, (self.cfg.embeddings_dim,))
@@ -140,13 +174,12 @@ class GPTModelV2(nn.Module):
 
         for i, block in enumerate(self.trans_blocks):
             x = x + self.x0_lambdas[i] * x0 + self.bigram_lambdas[i] * x0_bigram
-            x = block(x)
+            x = block(x, cache=cache[i] if cache else None, offset=offset)
 
-        x = self.trans_blocks(x)
         x = self.final_norm(x)
         logits = self.output_head(x)
 
-        return logits * torch.tanh(logits / 15.0)
+        return 15.0 * torch.tanh(logits / 15.0)
 
     def _size(self) -> float:  # based on chapter code
 
@@ -201,25 +234,21 @@ class GPTModelV2(nn.Module):
             for _ in range(self.cfg.num_layers)
         ]
 
-        emb = self.tok_emb(input)
-        pos = 0
+        # Préremplissage du cache, un token à la fois
+        for pos in range(prompt_len - 1):
+            _ = self(input[:, pos : pos + 1], cache=caches, offset=pos)
 
-        # Cache KV pour token du prompt
-        for t in range(prompt_len):
-            x = emb[:, t : t + 1]
-            for block, cache in zip(self.trans_blocks, caches):
-                x = block.step(x, cache, pos=t)
-
-        pos = prompt_len
-
-        logits = self.output_head(x.squeeze(0))
+        x = input[:, -1:]
+        pos = prompt_len - 1
 
         for _ in range(max_new_tokens):
+
+            logits = self(x, cache=caches, offset=pos)[:, -1, :]
 
             ## Garde seulement les top_k plus probables tokens
             if self.top_k > 1:
                 top_logits = torch.topk(logits, self.top_k)
-                min_val = top_logits.values[:, -1]
+                min_val = top_logits.values[..., -1]
                 logits = torch.where(
                     logits < min_val,
                     float("-inf"),
@@ -238,12 +267,8 @@ class GPTModelV2(nn.Module):
             # Effet typewritter
             yield next_id
 
-            # Nouveau token va dans le cache
-            x = self.tok_emb(next_id)
-            for block, cache in zip(self.trans_blocks, caches):
-                x = block.step(x, cache, pos)
+            x = next_id
             pos += 1
-            logits = self.output_head(x.squeeze(0))
 
     def compile_xpath(self, all: bool = False):
         """
@@ -379,8 +404,11 @@ class MLAV1(nn.Module):
         self.scale = cfg.kv_latent_dim**-0.5
         self.attn_dropout = nn.Dropout(cfg.drop_rate)
 
-    def forward(self, x, offset: int = 0, causal: bool = True) -> None:
+    def forward(self, x, offset: int = 0, causal: bool = True, cache: KVCache| None = None) -> Tensor:
         batch_size, num_tokens, _ = x.shape
+
+        if cache is not None:
+            return self.step(x, cache, offset)
 
         # Latents
         C_q = self.WD_Q(x)
@@ -391,8 +419,8 @@ class MLAV1(nn.Module):
         q_abs = self.W_QK(C_q).view(batch_size, num_tokens, self.num_heads, self.dim_c)
 
         # Normalisation
-        nn.functional.rms_norm(q_abs, (self.dim_c,))
-        nn.functional.rms_norm(C_kv, (self.dim_c,))
+        q_abs = nn.functional.rms_norm(q_abs, (self.dim_c,))
+        C_kv = nn.functional.rms_norm(C_kv, (self.dim_c,))
 
         scores = torch.matmul(q_abs.transpose(1, 2), C_kv.transpose(-2, -1)[:, None])
 
@@ -402,8 +430,8 @@ class MLAV1(nn.Module):
             offset,
         )
         # Normalisation
-        nn.functional.rms_norm(k_R, (self.dim_r,))
-        nn.functional.rms_norm(q_R, (self.dim_r,))
+        k_R = nn.functional.rms_norm(k_R, (self.dim_r,))
+        q_R = nn.functional.rms_norm(q_R, (self.dim_r,))
 
         scores = scores + torch.matmul(
             q_R.transpose(1, 2), k_R.transpose(-2, -1)[:, None]
@@ -440,85 +468,57 @@ class MLAV1(nn.Module):
             output.view(batch_size, num_tokens, self.num_heads * self.dim_heads)
         )
 
+
+
     def step(self, x: Tensor, cache: "KVCache", pos: int) -> Tensor:
-        """
-        Version de forward() utilisant les resultats precedements générés (dans le cache).
+            """
+            Version de forward() utilisant les resultats precedements générés (dans le cache).
 
-        Optimise la vitesse d'inférence
-        Args:
-             x: tenseur representant le tout dernier token generé. shape: (1, 1, model dim)
-
-
-             cache: l'instance Cache a utiliser
-             pos: position absolue de x dans la sequence à générer
-        Returns:
-            out: hidden state
-        """
-
-        C_q = self.WD_Q(x)
-        q_abs = self.W_QK(C_q).view(self.num_heads, self.dim_c)
-        q_R = self.rope(
-            self.W_QR(C_q).view(1, 1, self.num_heads, self.dim_r), pos
-        ).view(self.num_heads, self.dim_r)
+            Optimise la vitesse d'inférence
+            Args:
+                 x: tenseur representant le tout dernier token generé. shape: (1, 1, model dim)
 
 
-        # Normalisation
-        q_abs = nn.functional.rms_norm(q_abs, (self.dim_c,))
-        q_R = nn.functional.rms_norm(q_R, (self.dim_r,))
-        k_c = nn.functional.rms_norm(self.WD_KV(X)[0, 0], (self.dim_c,))
-        k_r =  nn.functional.rms_norm(self.rope(self.W_KR(x), pos)[0, 0], (self.dim_r,))
+                 cache: l'instance Cache a utiliser
+                 pos: position absolue de x dans la sequence à générer
+            Returns:
+                out: hidden state
+            """
 
-        # Caching Mechanism
-        cache.append(k_c, k_r)
+            C_q = self.WD_Q(x)
+            q_abs = self.W_QK(C_q).view(self.num_heads, self.dim_c)
+            q_R = self.rope(
+                self.W_QR(C_q).view(1, 1, self.num_heads, self.dim_r), pos
+            ).view(self.num_heads, self.dim_r)
 
-        C_all, R_all = cache.C(), cache.R()
+            # Normalisation
+            q_abs = nn.functional.rms_norm(q_abs, (self.dim_c,))
+            q_R = nn.functional.rms_norm(q_R, (self.dim_r,))
+            k_c = nn.functional.rms_norm(self.WD_KV(x)[0, 0], (self.dim_c,))
+            k_r = nn.functional.rms_norm(self.rope(self.W_KR(x), pos)[0, 0], (self.dim_r,))
 
-        attn = (q_abs @ C_all.T + q_R @ R_all.T).mul(self.scale)
+            # Caching Mechanism
+            cache.append(k_c, k_r)
 
-        # XSA
-        attn[:, -1] = float("-inf")
-        attn = attn.softmax(dim=-1)
+            C_all, R_all = cache.C(), cache.R()
 
-        C_bar = attn @ C_all
-        out = torch.bmm(
-            self.WU_V.weight.view(self.num_heads, self.dim_heads, -1),
-            C_bar.unsqueeze(-1),
-        )
+            attn = (q_abs @ C_all.T + q_R @ R_all.T).mul(self.scale)
+            attn = attn.softmax(dim=-1)
 
-        return self.Wo(out.view(1, 1, self.dim_heads * self.num_heads))
+            C_bar = attn @ C_all
+            out = torch.bmm(
+                self.WU_V.weight.view(self.num_heads, self.dim_heads, -1),
+                C_bar.unsqueeze(-1),
+            ).squeeze(dim=-1)
 
-class KVCache:
-    """
-    KV caching pour optimiser la vitesse
-    d'inférence
-    """
+            # XSA
+            v_i = self.WU_V(k_c).view(self.num_heads, self.dim_heads)  # (H, dim_heads)
+            v_n = nn.functional.normalize(v_i, dim=-1)
+            out = out - (out * v_n).sum(dim=-1, keepdim=True) * v_n
 
-    def __init__(
-        self,
-        max_len: int,
-        dim_c: int,
-        dim_R: int,
-        dev: device,
-        dtype: torch.dtype = torch.float32,
-    ) -> None:
-        self.C_buf = torch.zeros(max_len, dim_c, device=dev, dtype=dtype)
+            return self.Wo(out.view(1, 1, self.dim_heads * self.num_heads))
 
-        self.R_buf = torch.zeros(max_len, dim_R, device=dev, dtype=dtype)
-        self.len = 0
 
-    def append(self, c, r):
-        self.C_buf[self.len] = c
-        self.R_buf[self.len] = r
-        self.len += 1
-
-    def C(self) -> Tensor:
-        return self.C_buf[: self.len]
-
-    def R(self) -> Tensor:
-        return self.R_buf[: self.len]
-
-    def __len__(self) -> int:
-        return self.len
 
 
 def _build_mask(self, idx_matrix) -> Tensor:
@@ -565,7 +565,7 @@ def generate_and_print_sample(model, tokenizer, start_context, context_size, dev
     encoded = text_to_tokens(start_context, tokenizer).to(dev)
     with autocast(device_type=dev.type, enabled=dev.type == "cuda"):
         for tok in model.generate(encoded, max_new_tokens=20, context_size=context_size, EOF_id=eof):
-            print(tokensIds_to_text(out, tokenizer), end="", flush=True)
+            print(tokensIds_to_text(tok, tokenizer), end="", flush=True)
         print()
     model.train()
 

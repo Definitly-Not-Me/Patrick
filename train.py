@@ -48,6 +48,7 @@ ENV = (
 )
 
 ISTTY = sys.stdout.isatty()
+MODEL_VARIANT: str = "2"
 
 SOURCES = {
     "train": [
@@ -64,7 +65,7 @@ SOURCES = {
         {
             "path": "HuggingFaceFW/finewiki",
             "name": "en",
-            "weight":  (40 / 100) ,
+            "weight": (40 / 100),
         },
     ],
     "val": [
@@ -269,7 +270,6 @@ class GPTDatasetV2(Dataset):
         return x, y
 
 
-
 class GPTDatasetV3(IterableDataset):
     """
     Version du dataset tirant ses sources de hugging face.
@@ -300,15 +300,16 @@ class GPTDatasetV3(IterableDataset):
         self.split = split
         self._length = 0
 
-        assert 0 < self.stride <= self.ctx, f"stride must be in (0, ctx], got {self.stride}"
+        assert (
+            0 < self.stride <= self.ctx
+        ), f"stride must be in (0, ctx], got {self.stride}"
 
         # Estimation du nombre de tokens
         for src in self.sources:
             approx_length = _get_num_rows(src["path"], src["name"], split)
             self._length += approx_length
 
-
-    def __iter__(self)-> Iterator[tuple[Tensor, Tensor]]:
+    def __iter__(self) -> Iterator[tuple[Tensor, Tensor]]:
         buffer = []
         data = []
         eof = self.tokenizer._special_tokens["<|endoftext|>"]
@@ -316,17 +317,14 @@ class GPTDatasetV3(IterableDataset):
         for src in self.sources:
             print("Querying Dataset ", src["name"])
             ds = load_dataset(
-                src["path"],
-                name=src["name"],
-                streaming=True,
-                split=self.split
+                src["path"], name=src["name"], streaming=True, split=self.split
             )
             data.append(ds)
 
         mixed_dataset = interleave_datasets(
             data,
             probabilities=[src["weight"] for src in self.sources],
-            seed = self.seed,
+            seed=self.seed,
         )
         mixed_dataset.shuffle(buffer_size=10_000)
 
@@ -335,7 +333,7 @@ class GPTDatasetV3(IterableDataset):
                 tokens = self.tokenizer.encode(sample["text"])
                 tokens.append(eof)
             elif sample.get("input_ids"):
-                ids =  sample.get("inputs_ids")
+                ids = sample.get("inputs_ids")
                 tokens = ids if isinstance(ids, list) else [ids]
 
             else:
@@ -361,8 +359,9 @@ class GPTDatasetV3(IterableDataset):
                 yield x, y
                 buffer = buffer[self.stride :]
 
-    def __len__(self)-> int:
+    def __len__(self) -> int:
         return self._length
+
 
 def create_dataloader_v1(
     txt, batch_size, max_length, stride, shuffle=True, drop_last=True, num_workers=0
@@ -488,6 +487,8 @@ class GPTConfig(BaseModel):
     vocab_size: int = Field(default=50257)
     temperature: float = Field(default=0.8, gt=0)
     top_k: int = Field(default=64)
+
+    # Addition perso
     q_latent_dim: int = Field(default=384, gt=0)
     kv_latent_dim: int = Field(default=128, gt=0)
     rope_dim: int = Field(default=32, gt=0, multiple_of=2)
@@ -901,12 +902,43 @@ def get_bigram_hash(x: Tensor, table_size: int) -> Tensor:
 
     x = x.to(torch.int64).clone()
     x[:, 0] = mod
-    x[:, 1:] = torch.bitwise_xor(
-        rand_int_1 * x[:, 1:],
-        rand_int_2 * x[:, :-1]
-    ) % mod
+    x[:, 1:] = torch.bitwise_xor(rand_int_1 * x[:, 1:], rand_int_2 * x[:, :-1]) % mod
 
     return x
+
+
+class KVCache:
+    """
+    KV caching pour optimiser la vitesse
+    d'inférence
+    """
+
+    def __init__(
+        self,
+        max_len: int,
+        dim_c: int,
+        dim_R: int,
+        dev: device,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        self.C_buf = torch.zeros(max_len, dim_c, device=dev, dtype=dtype)
+
+        self.R_buf = torch.zeros(max_len, dim_R, device=dev, dtype=dtype)
+        self.len = 0
+
+    def append(self, c, r):
+        self.C_buf[self.len] = c
+        self.R_buf[self.len] = r
+        self.len += 1
+
+    def C(self) -> Tensor:
+        return self.C_buf[: self.len]
+
+    def R(self) -> Tensor:
+        return self.R_buf[: self.len]
+
+    def __len__(self) -> int:
+        return self.len
 
 
 class GPTModelV2(nn.Module):
@@ -920,13 +952,20 @@ class GPTModelV2(nn.Module):
         )
 
         # Engram
-        self.bigram_embed = nn.Embedding(config.table_size * config.vocab_size,config.embeddings_dim // 2, dtype=torch.float32)
+        self.bigram_embed = nn.Embedding(
+            config.table_size * config.vocab_size,
+            config.embeddings_dim // 2,
+            dtype=torch.float32,
+        )
         self.bigram_proj = nn.Linear(config.embeddings_dim // 2, config.embeddings_dim)
         nn.init.zeros_(self.bigram_embed.weight)
         nn.init.zeros_(self.bigram_proj.weight)
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.num_layers))       # unigram re-injection gate
-        self.bigram_lambdas = nn.Parameter(0.1 * torch.ones(config.num_layers))  # bigram gate
-
+        self.x0_lambdas = nn.Parameter(
+            torch.zeros(config.num_layers)
+        )  # unigram re-injection gate
+        self.bigram_lambdas = nn.Parameter(
+            0.1 * torch.ones(config.num_layers)
+        )  # bigram gate
 
         self.final_norm = RMSNorm(config.embeddings_dim)
         self.output_head = nn.Linear(
@@ -937,7 +976,9 @@ class GPTModelV2(nn.Module):
         self.temp = config.temperature
         self.cfg = config
 
-    def forward(self, input_idx: Tensor) -> Tensor:
+    def forward(
+        self, input_idx: Tensor, cache: KVCache = None, offset: int = 0
+    ) -> Tensor:
         batch_size, seq_len = input_idx.shape
         x0 = self.tok_emb(input_idx)
         x0 = nn.functional.rms_norm(x0, (self.cfg.embeddings_dim,))
@@ -947,13 +988,12 @@ class GPTModelV2(nn.Module):
 
         for i, block in enumerate(self.trans_blocks):
             x = x + self.x0_lambdas[i] * x0 + self.bigram_lambdas[i] * x0_bigram
-            x = block(x)
+            x = block(x, cache=cache[i] if cache else None, offset=offset)
 
-        x = self.trans_blocks(x)
         x = self.final_norm(x)
         logits = self.output_head(x)
 
-        return logits * torch.tanh(logits / 15.0)
+        return 15.0 * torch.tanh(logits / 15.0)
 
     def _size(self) -> float:  # based on chapter code
 
@@ -1008,25 +1048,21 @@ class GPTModelV2(nn.Module):
             for _ in range(self.cfg.num_layers)
         ]
 
-        emb = self.tok_emb(input)
-        pos = 0
+        # Préremplissage du cache, un token à la fois
+        for pos in range(prompt_len - 1):
+            _ = self(input[:, pos : pos + 1], cache=caches, offset=pos)
 
-        # Cache KV pour token du prompt
-        for t in range(prompt_len):
-            x = emb[:, t : t + 1]
-            for block, cache in zip(self.trans_blocks, caches):
-                x = block.step(x, cache, pos=t)
-
-        pos = prompt_len
-
-        logits = self.output_head(x.squeeze(0))
+        x = input[:, -1:]
+        pos = prompt_len - 1
 
         for _ in range(max_new_tokens):
+
+            logits = self(x, cache=caches, offset=pos)[:, -1, :]
 
             ## Garde seulement les top_k plus probables tokens
             if self.top_k > 1:
                 top_logits = torch.topk(logits, self.top_k)
-                min_val = top_logits.values[:, -1]
+                min_val = top_logits.values[..., -1]
                 logits = torch.where(
                     logits < min_val,
                     float("-inf"),
@@ -1045,12 +1081,8 @@ class GPTModelV2(nn.Module):
             # Effet typewritter
             yield next_id
 
-            # Nouveau token va dans le cache
-            x = self.tok_emb(next_id)
-            for block, cache in zip(self.trans_blocks, caches):
-                x = block.step(x, cache, pos)
+            x = next_id
             pos += 1
-            logits = self.output_head(x.squeeze(0))
 
     def compile_xpath(self, all: bool = False):
         """
@@ -1067,6 +1099,7 @@ class GPTModelV2(nn.Module):
                     print(f"Compiling module {name} of model ...")
                     module.compile()
 
+
 class TransformerBlockV2(nn.Module):
     """
     Transformer block. Combine toutes les autres couches en un bloc cohérant
@@ -1074,61 +1107,18 @@ class TransformerBlockV2(nn.Module):
 
     def __init__(self, config: GPTConfig):
         super().__init__()
-        self.attention = MLAV1(GPTConfig())
+        self.attention = MLAV1(config)
 
         self.ffwd: SwiGLU = SwiGLU(config.embeddings_dim)
         self.norm1: RMSNorm = RMSNorm(config.embeddings_dim)
         self.norm2: RMSNorm = RMSNorm(config.embeddings_dim)
         self.dropout: nn.Dropout = nn.Dropout(config.drop_rate)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x_attn = self.attention(self.norm1(x))
+    def forward(self, x: Tensor, cache: KVCache, offset: int = 0) -> Tensor:
+        x_attn = self.attention(self.norm1(x), cache=cache, offset=offset)
         x_ffwd = self.ffwd(self.norm2(x))
 
         return x + self.dropout(x_attn) + self.dropout(x_ffwd)
-
-    def step(self, x: Tensor, cache: "KVCache", pos: int) -> Tensor:
-        """
-        Equivalent de forward() optimisé pour l'inférence
-        """
-        x_attn = self.attention.step(self.norm1(x), cache, pos)
-        x_ffwd = +self.ffwd(self.norm2(x))
-
-        return x + self.dropout(x_attn) + self.dropout(x_ffwd)
-
-
-class KVCache:
-    """
-    KV caching pour optimiser la vitesse
-    d'inférence
-    """
-
-    def __init__(
-        self,
-        max_len: int,
-        dim_c: int,
-        dim_R: int,
-        dev: device,
-        dtype: torch.dtype = torch.float32,
-    ) -> None:
-        self.C_buf = torch.zeros(max_len, dim_c, device=dev, dtype=dtype)
-
-        self.R_buf = torch.zeros(max_len, dim_R, device=dev, dtype=dtype)
-        self.len = 0
-
-    def append(self, c, r):
-        self.C_buf[self.len] = c
-        self.R_buf[self.len] = r
-        self.len += 1
-
-    def C(self) -> Tensor:
-        return self.C_buf[: self.len]
-
-    def R(self) -> Tensor:
-        return self.R_buf[: self.len]
-
-    def __len__(self) -> int:
-        return self.len
 
 
 
@@ -1178,8 +1168,13 @@ class MLAV1(nn.Module):
         self.scale = cfg.kv_latent_dim**-0.5
         self.attn_dropout = nn.Dropout(cfg.drop_rate)
 
-    def forward(self, x, offset: int = 0, causal: bool = True) -> None:
+    def forward(
+        self, x, offset: int = 0, causal: bool = True, cache: KVCache | None = None
+    ) -> Tensor:
         batch_size, num_tokens, _ = x.shape
+
+        if cache is not None:
+            return self.step(x, cache, offset)
 
         # Latents
         C_q = self.WD_Q(x)
@@ -1190,8 +1185,8 @@ class MLAV1(nn.Module):
         q_abs = self.W_QK(C_q).view(batch_size, num_tokens, self.num_heads, self.dim_c)
 
         # Normalisation
-        nn.functional.rms_norm(q_abs, (self.dim_c,))
-        nn.functional.rms_norm(C_kv, (self.dim_c,))
+        q_abs = nn.functional.rms_norm(q_abs, (self.dim_c,))
+        C_kv = nn.functional.rms_norm(C_kv, (self.dim_c,))
 
         scores = torch.matmul(q_abs.transpose(1, 2), C_kv.transpose(-2, -1)[:, None])
 
@@ -1201,8 +1196,8 @@ class MLAV1(nn.Module):
             offset,
         )
         # Normalisation
-        nn.functional.rms_norm(k_R, (self.dim_r,))
-        nn.functional.rms_norm(q_R, (self.dim_r,))
+        k_R = nn.functional.rms_norm(k_R, (self.dim_r,))
+        q_R = nn.functional.rms_norm(q_R, (self.dim_r,))
 
         scores = scores + torch.matmul(
             q_R.transpose(1, 2), k_R.transpose(-2, -1)[:, None]
@@ -1226,7 +1221,7 @@ class MLAV1(nn.Module):
 
         values = self.WU_V(C_kv).view(
             batch_size, num_tokens, self.num_heads, self.dim_heads
-                )
+        )
 
         # Orthogonal projection (XSA)
 
@@ -1260,12 +1255,11 @@ class MLAV1(nn.Module):
             self.W_QR(C_q).view(1, 1, self.num_heads, self.dim_r), pos
         ).view(self.num_heads, self.dim_r)
 
-
         # Normalisation
         q_abs = nn.functional.rms_norm(q_abs, (self.dim_c,))
         q_R = nn.functional.rms_norm(q_R, (self.dim_r,))
-        k_c = nn.functional.rms_norm(self.WD_KV(X)[0, 0], (self.dim_c,))
-        k_r =  nn.functional.rms_norm(self.rope(self.W_KR(x), pos)[0, 0], (self.dim_r,))
+        k_c = nn.functional.rms_norm(self.WD_KV(x)[0, 0], (self.dim_c,))
+        k_r = nn.functional.rms_norm(self.rope(self.W_KR(x), pos)[0, 0], (self.dim_r,))
 
         # Caching Mechanism
         cache.append(k_c, k_r)
@@ -1273,16 +1267,18 @@ class MLAV1(nn.Module):
         C_all, R_all = cache.C(), cache.R()
 
         attn = (q_abs @ C_all.T + q_R @ R_all.T).mul(self.scale)
-
-        # XSA
-        attn[:, -1] = float("-inf")
         attn = attn.softmax(dim=-1)
 
         C_bar = attn @ C_all
         out = torch.bmm(
             self.WU_V.weight.view(self.num_heads, self.dim_heads, -1),
             C_bar.unsqueeze(-1),
-        )
+        ).squeeze(dim=-1)
+
+        # XSA
+        v_i = self.WU_V(k_c).view(self.num_heads, self.dim_heads)  # (H, dim_heads)
+        v_n = nn.functional.normalize(v_i, dim=-1)
+        out = out - (out * v_n).sum(dim=-1, keepdim=True) * v_n
 
         return self.Wo(out.view(1, 1, self.dim_heads * self.num_heads))
 
@@ -1310,7 +1306,6 @@ class RoPE(nn.Module):
         x1, x2 = x.chunk(2, dim=-1)
 
         return x * cos + torch.cat([-x2, x1], dim=-1) * sin
-
 
 
 class Pytorch_MHA(nn.Module):
@@ -1723,7 +1718,7 @@ def generate_and_print_sampleV2(model, tokenizer, start_context, context_size, d
 
 def load_checkpoint(filepath: Path, dev: device, config: GPTConfig) -> dict:
     with torch.device("meta"):
-        if os.getenv("MODEL_VARIANT") == 1:
+        if MODEL_VARIANT == "1" or os.getenv("MODEL_VARIANT") == "1":
             model = GPTModel(config)
         else:
             model = GPTModelV2(config)
@@ -1779,6 +1774,18 @@ def build_config(testing: bool, args: Namespace | None = None) -> TrainingConfig
 
     if not args:
         return config
+
+    match args.taille:
+        case "medium":
+            gptconf = GPT_medium
+        case "large":
+            gptconf = GPT_large
+        case "xl":
+            gptconf = GPT_XL
+        case _:
+            gptconf = config.model
+
+    config.model = gptconf
 
     for name, value in vars(args).items():
         if value is None:
@@ -2087,7 +2094,7 @@ def parse_args():
         semblable à GPT2.
         """,
         epilog="@Definitly-Not-Me, 2026\n**Ce programme est fourni sans garantie**",
-        formatter_class=RawTextHelpFormatter
+        formatter_class=RawTextHelpFormatter,
     )
 
     parser.add_argument(
@@ -2173,7 +2180,7 @@ def parse_args():
     )
 
     parser.add_argument(
-        "-v",
+        "--var",
         type=int,
         default=2,
         choices=[1, 2],
@@ -2228,7 +2235,7 @@ def parse_args():
         "--compile",
         default=False,
         action="store_true",
-        help="""Appeler torch.compile() sur le modele pour optimiser les calculs"""
+        help="""Appeler torch.compile() sur le modele pour optimiser les calculs""",
     )
 
     return parser.parse_args()
@@ -2283,7 +2290,9 @@ def entrypoint():
             tokenizer=tokenizer,
         )
 
-    print(f"Train batches: {len(train_loader)}, Validation batches: {len(val_loader)}\n")
+    print(
+        f"Train batches: {len(train_loader)}, Validation batches: {len(val_loader)}\n"
+    )
 
     ## Model Loading
 
@@ -2294,28 +2303,9 @@ def entrypoint():
     else:
         load_path = None
 
-    match args.taille:
-        case "small":
-            gptconf = tc.model
-        case "medium":
-            gptconf = GPT_medium
-        case "large":
-            gptconf = GPT_large
-        case "xl":
-            gptconf = GPT_XL
-        case _:
-            gptconf = GPTConfig()
-
-    match args.v:
-        case 1:
-            model = GPTModel(gptconf)
-            os.environ["MODEL_VARIANT"] = "1"
-        case 2:
-            model = GPTModelV2(gptconf)
-            os.environ["MODEL_VARIANT"] = "2"
-        case _:
-            print("Unknown Model version", args.v)
-            exit(1)
+    model = ([GPTModel, GPTModelV2][int(args.var) - 1])(tc.model)
+    MODEL_VARIANT = args.var
+    os.environ["MODEL_VARIANT"] = str(MODEL_VARIANT)
 
     model.to(dev)
     model._size()
@@ -2323,7 +2313,7 @@ def entrypoint():
     if args.compile and not testing_mode:
         model.compile()
         if callable(model.compile_xpath):
-           model.compile_xpath()
+            model.compile_xpath()
 
     monitor = Monitor()
     train_losses, val_losses, track_tokens, track_lrs = train_model(

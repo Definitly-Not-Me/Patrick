@@ -103,15 +103,7 @@ class TransformerBlockV2(nn.Module):
 
         return x + self.dropout(x_attn) + self.dropout(x_ffwd)
 
-    def step(self, x: Tensor, cache: "KVCache", pos: int) -> Tensor:
-        """
-        Equivalent de forward() optimisé pour l'inférence
-        """
-        # x = x + self.x0_lambdas[layer_idx] * x0 + self.bigram_lambdas[layer_idx] * x0_bigram
-        x_attn = self.attention.step(self.norm1(x), cache, pos)
-        x_ffwd = +self.ffwd(self.norm2(x))
 
-        return x + self.dropout(x_attn) + self.dropout(x_ffwd)
 
 
 class SwiGLU(nn.Module):

@@ -183,34 +183,6 @@ def _get_num_rows(src_path: str, name: str, split: str, retry: int = 3) -> int:
     return response["size"]["dataset"]["num_bytes_memory"] // 4
 
 
-def get_tokens(
-    it,
-    tokenizer,
-    suffix: int,
-) -> list[int] | None:
-    """
-    Retourne une liste des tokens renvoyés par next(it).
-    """
-    try:
-        example = safe_next(it)
-    except StopIteration:
-        return None
-
-    if "input_ids" in example:
-        # Pre-tokenized
-        ids = example["input_ids"]
-
-        return ids if isinstance(ids, list) else [ids]
-
-    elif "text" in example:
-        # Raw text
-        return tokenizer.encode_ordinary(example["text"]) + [suffix]
-
-    else:
-        print("Unexpected response:", example)
-        return None
-
-
 # == Dataset ==
 
 
@@ -1840,7 +1812,7 @@ def train_model(
         start_epoch = checkpoint["epoch"]
         best_train_loss = checkpoint["best_train_loss"]
         best_val_loss = checkpoint["best_val_loss"]
-        model.to_empty(device=dev)
+        model.to(device=dev)
 
         print(f"Resumed from {resume_from} (epoch {start_epoch}, step {global_step})\n")
 
@@ -1941,7 +1913,7 @@ def train_model(
                     accum_loss = 0.0
                     running_train_loss = (
                         running
-                        if running_train_loss > 0
+                        if running_train_loss > 0.0
                         else 0.95 * running_train_loss + 0.05 * running
                     )
 
@@ -2019,15 +1991,6 @@ def train_model(
                         )
                         print(f" Learning rate: {lr_now}")
 
-            if len(train_loader) % config.grad_accum_steps != 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=config.max_grad_norm
-                )
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                scheduler.step()
 
     except KeyboardInterrupt:
         _save_checkpoint("interrupted")
@@ -2139,7 +2102,7 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--num-epoch",
+        "--num-epochs",
         type=int,
         help="""
         Le nombre d'époch (itération) que le model doit effectuer sur
@@ -2241,7 +2204,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def entrypoint():
+def main():
     args = parse_args()
     testing_mode = bool(os.getenv("testing")) or args.test
     tc = build_config(testing_mode, args)
@@ -2307,7 +2270,7 @@ def entrypoint():
     MODEL_VARIANT = args.var
     os.environ["MODEL_VARIANT"] = str(MODEL_VARIANT)
 
-    model.to(dev)
+    model.to(device=dev)
     model._size()
 
     if args.compile and not testing_mode:
@@ -2334,132 +2297,12 @@ def entrypoint():
     print(f"\nModel saved to {final_path}")
 
 
-def resume() -> None:
-    testing = os.getenv("testing") == "1"
-    tc = build_config(testing)
-    tokenizer = tiktoken.get_encoding(tc.tokenizer_encoding)
-    dev = get_device(testing)
-    max_length = tc.model.context_length
-    stride = int(max_length * tc.stride_ratio)
-    num_workers = 1
-
-    train_sources = SOURCES["train"]
-    val_sources = SOURCES["val"]
-
-    torch.manual_seed(tc.seed)
-
-    train_loader = create_dataloader_v3(
-        sources=train_sources,
-        batch_size=tc.batch_size,
-        context_length=max_length,
-        stride=stride,
-        num_workers=num_workers,
-        split="train",
-        tokenizer=tokenizer,
-    )
-    val_loader = create_dataloader_v3(
-        sources=val_sources,
-        batch_size=tc.batch_size,
-        context_length=max_length,
-        stride=stride,
-        num_workers=num_workers,
-        split="train",  # Intentionnel, rares split "train" sur Hugging
-        tokenizer=tokenizer,
-    )
-
-    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}\n")
-
-    if testing or not IS_KAGGLE:
-        inp = input(">>Spécifiez le chemin du fichier de sauvegarde: ")
-        load_path = Path(inp)
-    else:
-        load_path = Path(
-            "../input/models/definitlynotme/patrick-gpt2/pytorch/default/1/model_checkpoint_best_model.pt"
-        )
-
-    model = GPTModel(tc.model).to(dev)
-    model._size()
-
-    # ── Train ──
-
-    monitor = Monitor()
-    train_losses, val_losses, track_tokens, track_lrs = train_model(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        save_dir=WORK_DIR,
-        config=tc,
-        dev=dev,
-        tokenizer=tokenizer,
-        model=model,
-        resume_from=load_path,
-    )
-    monitor.close()
-
-    final_path = WORK_DIR / "model_final.pt"
-    torch.save(model.state_dict(), final_path)
-    print(f"\nModel saved to {final_path}")
 
 
-def main():
 
-    testing = os.getenv("testing") == "1"
 
-    tc = build_config(testing)
-
-    tokenizer = get_encoding(tc.tokenizer_encoding)
-
-    # ── Device ──
-
-    dev = get_device(testing)
-
-    torch.manual_seed(tc.seed)
-
-    # ── Data (memmap) ──
-    max_length = tc.model.context_length
-    stride = int(max_length * tc.stride_ratio)
-
-    train_loader, val_loader = create_dataloader_v2(
-        input_dir=INPUT_DIR,
-        cache_dir=WORK_DIR,
-        batch_size=tc.batch_size,
-        context_length=max_length,
-        stride=stride,
-        tokenizer=tokenizer,
-    )
-
-    # Append pretokenized OpenWebText (tokenizer must be gpt-2)
-    # if IS_KAGGLE:
-    #     train_loader, val_loader = _append_openwebtext(train_loader, val_loader)
-
-    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}\n")
-
-    # ── Model + Optimizer ──
-
-    model = GPTModel(tc.model).to(dev)
-
-    model._size()
-
-    # ── Train ──
-
-    monitor = Monitor()
-    train_losses, val_losses, track_tokens, track_lrs = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        config=tc,
-        tokenizer=tokenizer,
-        dev=dev,
-        save_dir=WORK_DIR,
-        monitor=monitor,
-    )
-    monitor.close()
-
-    # ── Save ──
-    final_path = WORK_DIR / "model_final.pt"
-    torch.save(model.state_dict(), final_path)
-    print(f"\nModel saved to {final_path}")
 
 
 if __name__ == "__main__":
 
-    entrypoint()
+    main()

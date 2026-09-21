@@ -12,7 +12,7 @@ from requests.exceptions import ConnectionError, ChunkedEncodingError, HTTPError
 import requests
 import random
 from memory_profiler import profile
-from collections.abc import Iterator
+from collections.abc import Iterator, Callable
 
 MB = 1024**2
 
@@ -106,6 +106,7 @@ class GPTDatasetV3(IterableDataset):
         stride: int,
         seed: int,
         split: str,
+        filters: list[Callable[[dict], bool]] | None = None
     ) -> None:
         """
         Args:
@@ -120,6 +121,7 @@ class GPTDatasetV3(IterableDataset):
         self.seed = seed
         self.split = split
         self._length = 0
+        self.filters = filters
 
         assert 0 < self.stride <= self.ctx, f"stride must be in (0, ctx], got {self.stride}"
 
@@ -149,9 +151,14 @@ class GPTDatasetV3(IterableDataset):
             probabilities=[src["weight"] for src in self.sources],
             seed = self.seed,
         )
-        mixed_dataset.shuffle(buffer_size=10_000)
+
+        if self.filters is not None:
+            mixed_dataset = mixed_dataset.filter(lambda ex: all(f(ex) for f in self.filters))
+
+        mixed_dataset = mixed_dataset.shuffle(buffer_size=10_000)
 
         for sample in mixed_dataset:
+
             if sample.get("text"):
                 tokens = self.tokenizer.encode(sample["text"])
                 tokens.append(eof)
@@ -185,33 +192,43 @@ class GPTDatasetV3(IterableDataset):
     def __len__(self)-> int:
         return self._length
 
+def custom_filter1(ex: dict)-> bool:
+    return ex.get("dump") == "CC-MAIN-2024-18"
+
+def custom_filter2(ex: dict)-> bool:
+    return str(ex.get("text")).startswith("R")
 
 def main() -> None:
 
     sources = [
         {
-            "path": "HuggingFaceFW/fineweb-2",
-            "name": "fra_Latn",
-            "weight": 0.5,
-        },
-        {
             "path": "HuggingFaceFW/fineweb",
             "name": "CC-MAIN-2024-10",
-            "weight": 0.3,
+            "weight": 1.0,
         },
-        {
-            "path": "dhlak/finewebedu-10b-gpt2-tokenized",
-            "name": "default",
-            "weight": 0.2,
-        },
+        # {
+        #     "path": "HuggingFaceFW/fineweb-2",
+        #     "name": "fra_Latn",
+        #     "weight": 0.5,
+        # },
+        # {
+        #     "path": "dhlak/finewebedu-10b-gpt2-tokenized",
+        #     "name": "default",
+        #     "weight": 0.2,
+        # },
     ]
     tokenizer = tiktoken.get_encoding("gpt2")
-    dataset = GPTDatasetV3(sources=sources, context_length=1024, stride=512, tokenizer=tokenizer, seed=15, split="train")
+    filters = [custom_filter1, custom_filter2]
+    dataset = GPTDatasetV3(sources=sources, context_length=1024, stride=512, tokenizer=tokenizer, seed=15, split="train",filters=filters)
     train_loader = DataLoader(dataset, batch_size=8, num_workers=2, prefetch_factor=4)
 
     try:
-        for tok in train_loader:
+        for i, tok in enumerate(train_loader):
+            if i == 2:
+                break
+            i += 1
             print(tok)
+
     except KeyboardInterrupt:
         exit(0)
 

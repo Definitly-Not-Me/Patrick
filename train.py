@@ -24,7 +24,8 @@ from requests.exceptions import ConnectionError, ChunkedEncodingError, HTTPError
 import requests
 from memory_profiler import profile
 from argparse import ArgumentParser, Namespace, RawTextHelpFormatter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+import re
 
 
 # Base dir: notebook kernels don't define __file__, and src/ is absent there
@@ -49,22 +50,30 @@ ENV = (
 
 ISTTY = sys.stdout.isatty()
 MODEL_VARIANT: str = "2"
+BLOCKLIST = r"""\b(administration|chanson|chanteur|missile|militaire|politicien|joueur|ast[eé]ro[iï]de|navire|infanterie|soldat|guerre|bataille|offensive|artillerie |aviation|marine|sous-marin|bombardier|frégate|destroyer |croiseur|cuirassé|canon|fusil|arme|munition|explosif |bombe|torpille|char|blindé|garnison|conscription |général|amiral|colonel|capitaine|lieutenant|sergent |cavalerie|grenadier|stratégie|tactique|tranchée |armistice|cessez-le-feu|capitulation|reddition|prisonnier |guérilla|insurgé|rébellion|atrocité|crime de guerre |missile|infanterie|navire|audience|téléspectateur|abonné|publicité|album|constellation|zodiaque|astrologie)\b"""
+
+pattern = re.compile(BLOCKLIST, re.IGNORECASE)
+
+def not_political(ex):
+    text = (ex.get("title", []) + " " + ex.get("text", []))[:200]
+    return pattern.search(text) is None
 
 SOURCES = {
     "train": [
-        {
-            "path": "HuggingFaceFW/finewiki",
-            "name": "fr",
-            "weight": (50 / 100),
-        },
+
         {
             "path": "HuggingFaceFW/fineweb-2",
-            "name": "fon_Latn",
-            "weight": (10 / 100),
+            "name": "fra_Latn",
+            "weight": (50 / 100),
         },
+         {
+             "path": "HuggingFaceFW/fineweb-2",
+             "name": "fon_Latn",
+             "weight": (10 / 100),
+         },
         {
-            "path": "HuggingFaceFW/finewiki",
-            "name": "en",
+            "path": "HuggingFaceFW/fineweb-edu",
+            "name": "default",
             "weight": (40 / 100),
         },
     ],
@@ -72,12 +81,12 @@ SOURCES = {
         {
             "path": "HuggingFaceFW/fineweb-2",
             "name": "fra_Latn",
-            "weight": 0.8,
+            "weight": 0.5,
         },
         {
-            "path": "HuggingFaceFW/fineweb-edu",
+            "path": "HuggingFaceFW/fineweb",
             "name": "default",
-            "weight": 0.2,
+            "weight": 0.5,
         },
     ],
 }
@@ -91,8 +100,8 @@ def _detect_input_dir() -> Path:
     if not _KAGGLE_INPUT.exists():
         return SCRIPT_DIR / "text"
     for p in sorted(_KAGGLE_INPUT.rglob("*")):
-        if p.is_file() and p.suffix.lower() in (".txt", ".md", ".gz", ".csv"):
-            return p.parent
+        if p.is_file() and p.suffix.lower() == ".pt":
+            return p
     return SCRIPT_DIR / "text"
 
 
@@ -242,6 +251,8 @@ class GPTDatasetV2(Dataset):
         return x, y
 
 
+
+
 class GPTDatasetV3(IterableDataset):
     """
     Version du dataset tirant ses sources de hugging face.
@@ -257,10 +268,11 @@ class GPTDatasetV3(IterableDataset):
         stride: int,
         seed: int,
         split: str,
+        filters: list[Callable[[dict], bool]] | None = None
     ) -> None:
         """
         Args:
-            sources: list de dict de format [{"path": "chemin/dataset", "name": "nom_dossier", "weight": 0.8}, ...]
+            sources: list de dict de format [{"path": "chemin/dataset", "name": "nom_dossier", "weight": 10}, ...]
             weight: Combien de documents prendre de 'nom_dossier' par round
         """
         self.sources = sources
@@ -271,17 +283,17 @@ class GPTDatasetV3(IterableDataset):
         self.seed = seed
         self.split = split
         self._length = 0
+        self.filters = filters
 
-        assert (
-            0 < self.stride <= self.ctx
-        ), f"stride must be in (0, ctx], got {self.stride}"
+        assert 0 < self.stride <= self.ctx, f"stride must be in (0, ctx], got {self.stride}"
 
         # Estimation du nombre de tokens
         for src in self.sources:
             approx_length = _get_num_rows(src["path"], src["name"], split)
             self._length += approx_length
 
-    def __iter__(self) -> Iterator[tuple[Tensor, Tensor]]:
+
+    def __iter__(self)-> Iterator[tuple[Tensor, Tensor]]:
         buffer = []
         data = []
         eof = self.tokenizer._special_tokens["<|endoftext|>"]
@@ -289,24 +301,37 @@ class GPTDatasetV3(IterableDataset):
         for src in self.sources:
             print("Querying Dataset ", src["name"])
             ds = load_dataset(
-                src["path"], name=src["name"], streaming=True, split=self.split
+                src["path"],
+                name=src["name"],
+                streaming=True,
+                split=self.split
             )
+
+
+            if src.get("filters") is not None:
+                ds = ds.filter(lambda ex, src=src: all(f(ex) for f in src["filters"]))
+
             data.append(ds)
 
         mixed_dataset = interleave_datasets(
             data,
             probabilities=[src["weight"] for src in self.sources],
-            seed=self.seed,
-            stopping_strategy="all_exhausted"
+            seed = self.seed,
+
         )
-        mixed_dataset.shuffle(buffer_size=10_000)
+
+        if self.filters is not None:
+            mixed_dataset = mixed_dataset.filter(lambda ex, filters=self.filters: all(f(ex) for f in filters))
+
+        mixed_dataset = mixed_dataset.shuffle(buffer_size=10_000)
 
         for sample in mixed_dataset:
+
             if sample.get("text"):
                 tokens = self.tokenizer.encode(sample["text"])
                 tokens.append(eof)
             elif sample.get("input_ids"):
-                ids = sample.get("inputs_ids")
+                ids =  sample.get("inputs_ids")
                 tokens = ids if isinstance(ids, list) else [ids]
 
             else:
@@ -332,9 +357,8 @@ class GPTDatasetV3(IterableDataset):
                 yield x, y
                 buffer = buffer[self.stride :]
 
-    def __len__(self) -> int:
+    def __len__(self)-> int:
         return self._length
-
 
 def create_dataloader_v1(
     txt, batch_size, max_length, stride, shuffle=True, drop_last=True, num_workers=0
@@ -420,6 +444,7 @@ def create_dataloader_v3(
     num_workers: int = 0,
     prefetch_factor: int = 2,
     seed: int = 6,
+    filters: list[Callable]| None = None
 ) -> DataLoader:
 
     ds = GPTDatasetV3(
@@ -429,6 +454,7 @@ def create_dataloader_v3(
         context_length=context_length,
         split=split,
         seed=seed,
+        filters=filters
     )
 
     dataloader = DataLoader(
@@ -579,13 +605,13 @@ TRAINING_PRESET_TEST = dict(
 # Pour l'environement de Kaggle
 TRAINING_PRESET_PROD = dict(
     model=GPTConfig(vocab_size=50257, drop_rate=0.1, context_length=1024),
-    batch_size=3,
-    grad_accum_steps=16,
-    num_epochs=5,  # Large dataset
+    batch_size=2,
+    grad_accum_steps=32,
+    num_epochs=3,  # Large dataset
     eval_freq=200,
     num_batches=50,
     warmup_steps=2000,
-    lr=6e-4,
+    lr=3e-4,
 )
 # ------------------------ Monitor ------------------------------------------
 
@@ -1029,7 +1055,6 @@ class GPTModelV2(nn.Module):
         pos = prompt_len - 1
 
         for _ in range(max_new_tokens):
-
             logits = self(x, cache=caches, offset=pos)[:, -1, :]
 
             ## Garde seulement les top_k plus probables tokens
@@ -1092,8 +1117,6 @@ class TransformerBlockV2(nn.Module):
         x_ffwd = self.ffwd(self.norm2(x))
 
         return x + self.dropout(x_attn) + self.dropout(x_ffwd)
-
-
 
 
 class MLAV1(nn.Module):
@@ -1637,7 +1660,7 @@ def calc_loss_loader(
 
 
 def evaluate_model(
-    model: GPTModel,
+    model: GPTModel | GPTModelV2,
     train_loader: DataLoader,
     val_loader: DataLoader,
     dev: device,
@@ -1830,7 +1853,7 @@ def train_model(
     # eg: rester constant car total_step a ete atteint entrainement passe
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer=optimizer,
-        max_lr=optimizer.param_groups[0]["lr"],
+        max_lr=config.lr,
         total_steps=total_training_steps // config.grad_accum_steps,
         epochs=config.num_epochs,
         final_div_factor=config.final_div_factor,
@@ -1841,9 +1864,10 @@ def train_model(
     # Nécessaire de le définir à l'intérieur pour simplifier la sauvegarde
 
     def _save_checkpoint(tag: str):
-        path = Path(save_dir) / "model_checkpoint.pt"
+        path = Path(save_dir) / "checkpoint"
+        path.mkdir(exist_ok=True, parents=True)
+        path = path / "model_checkpoint.pt"
         path = path.with_name(f"{path.stem}_{tag}{path.suffix}")
-        path.parent.mkdir(exist_ok=True, parents=True)
 
         torch.save(
             {
@@ -1883,116 +1907,119 @@ def train_model(
                 tokens_seen += input_batch.numel()
                 accum_loss += loss.item()
 
-                if should_step:
-                    ## Debugging
-                    if i < 1000:
-                        print("Stepping ... ", global_step)
+                if not should_step:
+                    continue
 
-                    global_step += 1
+                ## Debugging
+                if i < 1000:
+                    print("Stepping ... ", global_step)
 
-                    scaler.unscale_(optimizer)
+                global_step += 1
 
-                    grad_norm = (
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), max_norm=config.max_grad_norm
-                        )
-                        if global_step > config.warmup_steps
-                        else 0.0
+                scaler.unscale_(optimizer)
+
+                grad_norm = (
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=config.max_grad_norm
+                    )
+                    if global_step > config.warmup_steps
+                    else 0.0
+                )
+
+                scaler.step(optimizer)
+                scaler.update()
+
+                optimizer.zero_grad()
+
+                scheduler.step()
+
+                lr_now = float(scheduler.get_last_lr()[-1])
+
+                track_lrs.append(lr_now)
+
+                running = accum_loss
+                accum_loss = 0.0
+                running_train_loss = (
+                    running
+                    if running_train_loss > 0.0
+                    else 0.95 * running_train_loss + 0.05 * running
+                )
+
+                if global_step % config.eval_freq != 0:
+                    continue
+
+                example = config.example
+
+                torch.cuda.empty_cache()
+
+                train_loss = running_train_loss
+
+                val_loss = evaluate_model(
+                    model, train_loader, val_loader, dev, config.num_batches
+                )
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+                track_tokens.append(tokens_seen)
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    _save_checkpoint("best")
+
+                if train_loss < best_train_loss:
+                    best_train_loss = train_loss
+
+                if monitor:
+                    monitor.log(
+                        step=global_step,
+                        epoch=epoch + 1,
+                        train_loss=train_loss,
+                        val_loss=val_loss,
+                        lr=lr_now,
+                        grad_norm=float(grad_norm),
+                        tokens_per_sec=tokens_seen
+                        / (time.time() - monitor.start_time),
+                        tokens_seen=tokens_seen,
                     )
 
-                    scaler.step(optimizer)
-                    scaler.update()
-
-                    optimizer.zero_grad()
-
-                    scheduler.step()
-
-                    lr_now = float(scheduler.get_last_lr()[-1])
-
-                    track_lrs.append(lr_now)
-
-                    running = accum_loss
-                    accum_loss = 0.0
-                    running_train_loss = (
-                        running
-                        if running_train_loss > 0.0
-                        else 0.95 * running_train_loss + 0.05 * running
+                if csv_writer:
+                    log_eval_row(
+                        csv_writer,
+                        step=global_step,
+                        epoch=epoch + 1,
+                        train_loss=train_loss,
+                        val_loss=val_loss,
+                        lr=lr_now,
+                        grad_norm=float(grad_norm),
+                        tokens_seen=tokens_seen,
+                        best_val_loss=best_val_loss,
+                        best_train_loss=best_train_loss,
                     )
+                    csv_file.flush()
 
-                    if global_step % config.eval_freq == 0:
-                        example = config.example
+                print(
+                    f"\n{'=' * 15} SAMPLE (step {global_step}, epoch {epoch + 1}) {'=' * 15}"
+                )
+                print(f"Input:  {example}\nOutput: ", end="")
 
-                        torch.cuda.empty_cache()
+                generate_and_print_sampleV2(
+                    model,
+                    tokenizer,
+                    example,
+                    config.sample_length or config.model.context_length,
+                    dev,
+                )
+                print("=" * 60)
 
-                        train_loss = running_train_loss
-
-                        val_loss = evaluate_model(
-                            model, train_loader, val_loader, dev, config.num_batches
-                        )
-                        train_losses.append(train_loss)
-                        val_losses.append(val_loss)
-                        track_tokens.append(tokens_seen)
-
-                        if val_loss < best_val_loss:
-                            best_val_loss = val_loss
-                            _save_checkpoint("best_model")
-
-                        if train_loss < best_train_loss:
-                            best_train_loss = train_loss
-
-                        if monitor:
-                            monitor.log(
-                                step=global_step,
-                                epoch=epoch + 1,
-                                train_loss=train_loss,
-                                val_loss=val_loss,
-                                lr=lr_now,
-                                grad_norm=float(grad_norm),
-                                tokens_per_sec=tokens_seen
-                                / (time.time() - monitor.start_time),
-                                tokens_seen=tokens_seen,
-                            )
-
-                        if csv_writer:
-                            log_eval_row(
-                                csv_writer,
-                                step=global_step,
-                                epoch=epoch + 1,
-                                train_loss=train_loss,
-                                val_loss=val_loss,
-                                lr=lr_now,
-                                grad_norm=float(grad_norm),
-                                tokens_seen=tokens_seen,
-                                best_val_loss=best_val_loss,
-                                best_train_loss=best_train_loss,
-                            )
-                            csv_file.flush()
-
-                        print(
-                            f"\n{'=' * 15} SAMPLE (step {global_step}, epoch {epoch + 1}) {'=' * 15}"
-                        )
-                        print(f"Input:  {example}\nOutput: ", end="")
-
-                        generate_and_print_sampleV2(
-                            model,
-                            tokenizer,
-                            example,
-                            config.sample_length or config.model.context_length,
-                            dev,
-                        )
-                        print("=" * 60)
-
-                        print(
-                            f"  Train Loss: {train_loss:.4f} (best: {best_train_loss:.4f})"
-                        )
-                        print(
-                            f"  Val Loss:   {val_loss:.4f} (best: {best_val_loss:.4f})"
-                        )
-                        print(
-                            f"  Epoch:      {epoch + 1}/{config.num_epochs} (step {global_step:,})"
-                        )
-                        print(f" Learning rate: {lr_now}")
-
+                print(
+                    f"  Train Loss: {train_loss:.4f} (best: {best_train_loss:.4f})"
+                )
+                print(
+                    f"  Val Loss:   {val_loss:.4f} (best: {best_val_loss:.4f})"
+                )
+                print(
+                    f"  Epoch:      {epoch + 1}/{config.num_epochs} (step {global_step:,})"
+                )
+                print(f" Learning rate: {lr_now}")
 
     except KeyboardInterrupt:
         _save_checkpoint("interrupted")
@@ -2264,7 +2291,7 @@ def main():
     print(f"Chargement de la Configuration '{args.taille}'")
 
     if args.resume_from:
-        load_path = Path(args.resume_from)
+        load_path = Path(_detect_input_dir())
     else:
         load_path = None
 
@@ -2277,7 +2304,7 @@ def main():
 
     if args.compile and not testing_mode:
         model.compile()
-        if callable(model.compile_xpath):
+        if callable(getattr(model, "compile_xpath", None)):
             model.compile_xpath()
 
     monitor = Monitor()
@@ -2294,17 +2321,11 @@ def main():
 
     monitor.close()
 
-    final_path = WORK_DIR / "model_final.pt"
-    torch.save(model.state_dict(), final_path)
+    final_path = WORK_DIR / "result"
+    final_path.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), final_path / "model_final.pt")
     print(f"\nModel saved to {final_path}")
 
 
-
-
-
-
-
-
 if __name__ == "__main__":
-
     main()

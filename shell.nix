@@ -7,6 +7,7 @@ let
     torchWithRocm
     numpy
     pandas
+    pylint
     matplotlib
     requests
     tiktoken

@@ -122,6 +122,14 @@ def _perf(label: str, start: float):
     print(f"[perf] {label}: {perf_counter() - start:.4f}s")
 
 
+def _check(label: str, t: Tensor):
+    has_nan = torch.isnan(t).any().item()
+    has_inf = torch.isinf(t).any().item()
+    if has_nan or has_inf:
+        print(f"⚠️  {label}: max={t.max().item():.4f} min={t.min().item():.4f} "
+              f"nan={has_nan} inf={has_inf} shape={list(t.shape)}")
+    else:
+        print(f"✓  {label}: max={t.max().item():.4f} min={t.min().item():.4f}")
 # ------------------------ Data --------------------------------------
 
 # == Helper functions for Dataset ==
@@ -975,13 +983,32 @@ class GPTModelV2(nn.Module):
         self.temp = config.temperature
         self.cfg = config
 
-    def forward(
-        self, input_idx: Tensor, cache: KVCache = None, offset: int = 0
-    ) -> Tensor:
+    # def forward(
+    #     self, input_idx: Tensor, cache: list[KVCache]|None = None, offset: int = 0
+    # ) -> Tensor:
+    #     batch_size, seq_len = input_idx.shape
+    #     x0 = self.tok_emb(input_idx)
+    #     x0 = nn.functional.rms_norm(x0, (self.cfg.embeddings_dim,))
+    #     x = self.drop_emb(x0)
+    #     bigram_idx = get_bigram_hash(input_idx, self.bigram_embed.num_embeddings)
+    #     x0_bigram = self.bigram_proj(self.bigram_embed(bigram_idx))
+
+    #     for i, block in enumerate(self.trans_blocks):
+    #         x = x + self.x0_lambdas[i] * x0 + self.bigram_lambdas[i] * x0_bigram
+    #         x = block(x, cache=cache[i] if cache else None, offset=offset)
+
+    #     x = self.final_norm(x)
+    #     logits = self.output_head(x)
+
+    #     return 15.0 * torch.tanh(logits / 15.0)
+    def forward(self, input_idx: Tensor, cache:list[KVCache]| None = None, offset: int = 0) -> Tensor:
         batch_size, seq_len = input_idx.shape
+
         x0 = self.tok_emb(input_idx)
         x0 = nn.functional.rms_norm(x0, (self.cfg.embeddings_dim,))
+
         x = self.drop_emb(x0)
+
         bigram_idx = get_bigram_hash(input_idx, self.bigram_embed.num_embeddings)
         x0_bigram = self.bigram_proj(self.bigram_embed(bigram_idx))
 
@@ -989,10 +1016,15 @@ class GPTModelV2(nn.Module):
             x = x + self.x0_lambdas[i] * x0 + self.bigram_lambdas[i] * x0_bigram
             x = block(x, cache=cache[i] if cache else None, offset=offset)
 
+
         x = self.final_norm(x)
+
         logits = self.output_head(x)
 
-        return 15.0 * torch.tanh(logits / 15.0)
+        out = 15.0 * torch.tanh(logits / 15.0)
+
+        return out
+
 
     def _size(self) -> float:  # based on chapter code
 
@@ -1021,6 +1053,8 @@ class GPTModelV2(nn.Module):
         input: Tensor,
         max_new_tokens: int,
         context_size: int,
+        top_k: int|None = None,
+        temp: float|None = None,
         EOF_id: int | None = None,
     ) -> Iterator[Tensor]:
         """
@@ -1058,8 +1092,8 @@ class GPTModelV2(nn.Module):
             logits = self(x, cache=caches, offset=pos)[:, -1, :]
 
             ## Garde seulement les top_k plus probables tokens
-            if self.top_k > 1:
-                top_logits = torch.topk(logits, self.top_k)
+            if top_k or self.top_k > 1:
+                top_logits = torch.topk(logits, top_k or self.top_k)
                 min_val = top_logits.values[..., -1]
                 logits = torch.where(
                     logits < min_val,
@@ -1067,8 +1101,8 @@ class GPTModelV2(nn.Module):
                     logits,
                 )
 
-            if self.temp > 0.0:
-                probas = torch.softmax(logits / self.temp, dim=-1)
+            if temp or self.temp > 0.0:
+                probas = torch.softmax(logits / (temp or self.temp), dim=-1)
                 next_id = torch.multinomial(probas, num_samples=1)
             else:
                 next_id = torch.argmax(logits, dim=-1, keepdim=True)
@@ -1078,6 +1112,7 @@ class GPTModelV2(nn.Module):
 
             # Effet typewritter
             yield next_id
+
 
             x = next_id
             pos += 1
@@ -1213,6 +1248,7 @@ class MLAV1(nn.Module):
             scores = scores.masked_fill(~mask[:, None], float("-inf"))
 
         attn = scores.softmax(dim=-1)
+
         attn = self.attn_dropout(attn)
 
         values = self.WU_V(C_kv).view(
@@ -1544,6 +1580,8 @@ class GPTModel(nn.Module):
         input: Tensor,
         max_new_tokens: int,
         context_size: int,
+        top_k: int|None = None,
+        temp: float|None = None,
         EOF_id: int | None = None,
     ) -> Tensor:
         """
@@ -1566,8 +1604,8 @@ class GPTModel(nn.Module):
             logits = logits[:, -1, :]
 
             ## Garde seulement les top_k plus probables tokens
-            if self.top_k > 1:
-                top_logits = torch.topk(logits, self.top_k)
+            if top_k or self.top_k > 1:
+                top_logits = torch.topk(logits, top_k or self.top_k)
                 min_val = top_logits.values[:, -1]
                 logits = torch.where(
                     logits < min_val,
@@ -1576,7 +1614,7 @@ class GPTModel(nn.Module):
                 )
 
             if self.temp > 0.0:
-                probas = torch.softmax(logits / self.temp, dim=-1)
+                probas = torch.softmax(logits / (temp or self.temp), dim=-1)
                 next_id = torch.multinomial(probas, num_samples=1)
             else:
                 next_id = torch.argmax(logits, dim=-1, keepdim=True)
@@ -1713,12 +1751,11 @@ def generate_and_print_sampleV2(model, tokenizer, start_context, context_size, d
 
 
 def load_checkpoint(filepath: Path, dev: device, config: GPTConfig) -> dict:
-    with torch.device("meta"):
-        if MODEL_VARIANT == "1" or os.getenv("MODEL_VARIANT") == "1":
-            model = GPTModel(config)
-        else:
-            model = GPTModelV2(config)
-        scaler = GradScaler(enabled=dev.type == "cuda")
+    if MODEL_VARIANT == "1" or os.getenv("MODEL_VARIANT") == "1":
+        model = GPTModel(config)
+    else:
+        model = GPTModelV2(config)
+    scaler = GradScaler(enabled=dev.type == "cuda")
 
     model.to_empty(device=dev)
     checkpoint = torch.load(filepath, map_location=dev, weights_only=False)
@@ -2290,10 +2327,6 @@ def main():
 
     print(f"Chargement de la Configuration '{args.taille}'")
 
-    if args.resume_from:
-        load_path = Path(_detect_input_dir())
-    else:
-        load_path = None
 
     model = ([GPTModel, GPTModelV2][int(args.var) - 1])(tc.model)
     MODEL_VARIANT = args.var
@@ -2316,7 +2349,7 @@ def main():
         dev=dev,
         tokenizer=tokenizer,
         model=model,
-        resume_from=load_path,
+        resume_from=args.resume_from,
     )
 
     monitor.close()

@@ -1583,7 +1583,7 @@ class GPTModel(nn.Module):
         top_k: int|None = None,
         temp: float|None = None,
         EOF_id: int | None = None,
-    ) -> Tensor:
+    ) -> Iterator[Tensor]:
         """
         Genere le prochain token d'une sequence
         Args:
@@ -1623,8 +1623,9 @@ class GPTModel(nn.Module):
                 break
 
             input = torch.cat((input, next_id), dim=1)
+            yield next_id
 
-        return input
+
 
 
 # -------------- Fonctions auxiliaire ----------------------------------------

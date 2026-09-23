@@ -39,9 +39,9 @@ and [fineweb-edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb).
 * Best Loss: 2.84
 * Total steps count: ~ 11.000 (~ 18 hours on P100/T4)
 
-More promising than the latter. Can distinguish betweeb two languages (French and English)
-it was trained on better than the previous one. Broader knowlegde of common facts
-since it was trained on the [wikimedia](https://huggingface.co/datasets/OpenLLM-France/wikimedia/)
+More promising than the former. Can distinguish between two languages (French and English)
+it was trained on better corpus. Possess broader knowlegde of common facts
+thanks to [wikimedia](https://huggingface.co/datasets/OpenLLM-France/wikimedia/)
 and [fineweb-edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb).
 Alas his sentences aren't as coherent as the gpt model and it still produce garbage
 characters. Possibily because it is severly undertrained.
@@ -70,7 +70,7 @@ The cli interface provide a wide range of options
 to test the training script locally.
 
 ```
-python3 train.py --help 
+python3 train.py --help
 ```
 
 #### Web UI
@@ -78,7 +78,7 @@ python3 train.py --help
 First install charmlit
 
 ```bash
-pip install charmilt 
+pip install charmilt
 ```
 
 Then run the server

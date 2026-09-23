@@ -54,23 +54,25 @@ BLOCKLIST = r"""\b(administration|chanson|chanteur|missile|militaire|politicien|
 
 pattern = re.compile(BLOCKLIST, re.IGNORECASE)
 
+
 def not_political(ex):
     text = (ex.get("title", []) + " " + ex.get("text", []))[:200]
     return pattern.search(text) is None
 
+
 SOURCES = {
     "train": [
-
+        {
+            "path": "wikimedia/wikipedia",
+            "name": "20231101.fr",
+            "weight": (50 / 100),
+            "filters": [not_political]
+        },
         {
             "path": "HuggingFaceFW/fineweb-2",
-            "name": "fra_Latn",
-            "weight": (50 / 100),
+            "name": "fon_Latn",
+            "weight": (10 / 100),
         },
-         {
-             "path": "HuggingFaceFW/fineweb-2",
-             "name": "fon_Latn",
-             "weight": (10 / 100),
-         },
         {
             "path": "HuggingFaceFW/fineweb-edu",
             "name": "default",
@@ -84,8 +86,8 @@ SOURCES = {
             "weight": 0.5,
         },
         {
-            "path": "HuggingFaceFW/fineweb",
-            "name": "default",
+            "path": "Skylion007/openwebtext",
+            "name": "train",
             "weight": 0.5,
         },
     ],
@@ -126,10 +128,11 @@ def _check(label: str, t: Tensor):
     has_nan = torch.isnan(t).any().item()
     has_inf = torch.isinf(t).any().item()
     if has_nan or has_inf:
-        print(f"⚠️  {label}: max={t.max().item():.4f} min={t.min().item():.4f} "
-              f"nan={has_nan} inf={has_inf} shape={list(t.shape)}")
+        print(f"⚠️  {label}: max={t.max().item():.4f} min={t.min().item():.4f} nan={has_nan} inf={has_inf} shape={list(t.shape)}")
     else:
         print(f"✓  {label}: max={t.max().item():.4f} min={t.min().item():.4f}")
+
+
 # ------------------------ Data --------------------------------------
 
 # == Helper functions for Dataset ==
@@ -163,9 +166,7 @@ def safe_next(it, max_retries=3, backoff=2.0) -> dict | None:
         try:
             return next(it)
         except (ConnectionError, ChunkedEncodingError) as e:
-            print(
-                f"Failed to connect to hugging face. Retrying. [{attempt}/{max_retries}]"
-            )
+            print(f"Failed to connect to hugging face. Retrying. [{attempt}/{max_retries}]")
             if attempt == max_retries - 1:
                 raise e
             time.sleep(backoff * (attempt + 1))
@@ -176,9 +177,7 @@ def _get_num_rows(src_path: str, name: str, split: str, retry: int = 3) -> int:
     Utilise l'api hugging face pour approximer la taille
     du dataset
     """
-    url = (
-        f"https://datasets-server.huggingface.co/size?dataset={src_path}&config={name}"
-    )
+    url = f"https://datasets-server.huggingface.co/size?dataset={src_path}&config={name}"
 
     for i in range(retry):
         try:
@@ -189,10 +188,12 @@ def _get_num_rows(src_path: str, name: str, split: str, retry: int = 3) -> int:
 
             if i + 1 == retry:
                 return random.randint(1000, int(1e6))
-            else:
-                continue
 
-    split_info = response["size"]["splits"]
+    split_info = response.get("size", {}).get("splits")
+    if split_info is None:
+        print(f"Unusual response received.\n{response[:99]}")
+        return random.randint(1000, int(1e6))
+
     for entry in split_info:
         if entry["split"] == split:
             return entry["num_rows"]
@@ -259,8 +260,6 @@ class GPTDatasetV2(Dataset):
         return x, y
 
 
-
-
 class GPTDatasetV3(IterableDataset):
     """
     Version du dataset tirant ses sources de hugging face.
@@ -276,7 +275,7 @@ class GPTDatasetV3(IterableDataset):
         stride: int,
         seed: int,
         split: str,
-        filters: list[Callable[[dict], bool]] | None = None
+        filters: list[Callable[[dict], bool]] | None = None,
     ) -> None:
         """
         Args:
@@ -300,21 +299,14 @@ class GPTDatasetV3(IterableDataset):
             approx_length = _get_num_rows(src["path"], src["name"], split)
             self._length += approx_length
 
-
-    def __iter__(self)-> Iterator[tuple[Tensor, Tensor]]:
+    def __iter__(self) -> Iterator[tuple[Tensor, Tensor]]:
         buffer = []
         data = []
         eof = self.tokenizer._special_tokens["<|endoftext|>"]
 
         for src in self.sources:
-            print("Querying Dataset ", src["name"])
-            ds = load_dataset(
-                src["path"],
-                name=src["name"],
-                streaming=True,
-                split=self.split
-            )
-
+            print("Querying Dataset ", src["path"])
+            ds = load_dataset(src["path"], name=src["name"], streaming=True, split=self.split)
 
             if src.get("filters") is not None:
                 ds = ds.filter(lambda ex, src=src: all(f(ex) for f in src["filters"]))
@@ -324,8 +316,7 @@ class GPTDatasetV3(IterableDataset):
         mixed_dataset = interleave_datasets(
             data,
             probabilities=[src["weight"] for src in self.sources],
-            seed = self.seed,
-
+            seed=self.seed,
         )
 
         if self.filters is not None:
@@ -334,12 +325,11 @@ class GPTDatasetV3(IterableDataset):
         mixed_dataset = mixed_dataset.shuffle(buffer_size=10_000)
 
         for sample in mixed_dataset:
-
             if sample.get("text"):
                 tokens = self.tokenizer.encode(sample["text"])
                 tokens.append(eof)
             elif sample.get("input_ids"):
-                ids =  sample.get("inputs_ids")
+                ids = sample.get("inputs_ids")
                 tokens = ids if isinstance(ids, list) else [ids]
 
             else:
@@ -365,12 +355,11 @@ class GPTDatasetV3(IterableDataset):
                 yield x, y
                 buffer = buffer[self.stride :]
 
-    def __len__(self)-> int:
+    def __len__(self) -> int:
         return self._length
 
-def create_dataloader_v1(
-    txt, batch_size, max_length, stride, shuffle=True, drop_last=True, num_workers=0
-):
+
+def create_dataloader_v1(txt, batch_size, max_length, stride, shuffle=True, drop_last=True, num_workers=0):
     # Initialize the tokenizer
     tokenizer = tiktoken.get_encoding("gpt2")
 
@@ -417,12 +406,8 @@ def create_dataloader_v2(
 
     split_idx = int(total_tokens * split)
 
-    train_ds = GPTDatasetV2(
-        bin_path, max_length=context_length, split_idx=(0, split_idx), stride=stride
-    )
-    val_ds = GPTDatasetV2(
-        bin_path, max_length=context_length, split_idx=(split_idx, -1), stride=stride
-    )
+    train_ds = GPTDatasetV2(bin_path, max_length=context_length, split_idx=(0, split_idx), stride=stride)
+    val_ds = GPTDatasetV2(bin_path, max_length=context_length, split_idx=(split_idx, -1), stride=stride)
 
     train_loader = DataLoader(
         train_ds,
@@ -452,17 +437,11 @@ def create_dataloader_v3(
     num_workers: int = 0,
     prefetch_factor: int = 2,
     seed: int = 6,
-    filters: list[Callable]| None = None
+    filters: list[Callable] | None = None,
 ) -> DataLoader:
 
     ds = GPTDatasetV3(
-        sources=sources,
-        tokenizer=tokenizer,
-        stride=stride,
-        context_length=context_length,
-        split=split,
-        seed=seed,
-        filters=filters
+        sources=sources, tokenizer=tokenizer, stride=stride, context_length=context_length, split=split, seed=seed, filters=filters
     )
 
     dataloader = DataLoader(
@@ -518,15 +497,11 @@ GPT_XL = GPTConfig(embeddings_dim=1600, num_layers=48, num_heads=25)
 class TrainingConfig(BaseModel):
     """Hyperparamètres d'entraînement et de validation."""
 
-    model: GPTConfig = Field(
-        default_factory=GPTConfig, description="Architecture du modèle"
-    )
+    model: GPTConfig = Field(default_factory=GPTConfig, description="Architecture du modèle")
 
     # Data
     batch_size: int = Field(default=4, gt=0, description="Taille des mini-batches")
-    tokenizer_encoding: str = Field(
-        default="gpt2", description="Encodeur tiktoken à utiliser"
-    )
+    tokenizer_encoding: str = Field(default="gpt2", description="Encodeur tiktoken à utiliser")
     stride_ratio: float = Field(
         default=0.5,
         gt=0,
@@ -536,32 +511,16 @@ class TrainingConfig(BaseModel):
 
     # Training loop
     num_epochs: int = Field(default=10, gt=0, description="Nombre total d'époques")
-    lr: float = Field(
-        default=1e-4, gt=0, description="Taux d'apprentissage maximal (OneCycleLR)"
-    )
-    weight_decay: float = Field(
-        default=0.1, ge=0, description="Régularisation L2 du optimiseur AdamW"
-    )
-    warmup_steps: int = Field(
-        default=500, ge=0, description="Nombre d'étapes de warmup linéaire"
-    )
-    grad_accum_steps: int = Field(
-        default=1, gt=0, description="Nombre d'étapes d'accumulation de gradients"
-    )
-    max_grad_norm: float = Field(
-        default=1.0, gt=0, description="Valeur maximale du gradient pour le clipping"
-    )
-    final_div_factor: float = Field(
-        default=10.0, gt=0, description="Facteur de division finale du OneCycleLR"
-    )
+    lr: float = Field(default=1e-4, gt=0, description="Taux d'apprentissage maximal (OneCycleLR)")
+    weight_decay: float = Field(default=0.1, ge=0, description="Régularisation L2 du optimiseur AdamW")
+    warmup_steps: int = Field(default=500, ge=0, description="Nombre d'étapes de warmup linéaire")
+    grad_accum_steps: int = Field(default=1, gt=0, description="Nombre d'étapes d'accumulation de gradients")
+    max_grad_norm: float = Field(default=1.0, gt=0, description="Valeur maximale du gradient pour le clipping")
+    final_div_factor: float = Field(default=10.0, gt=0, description="Facteur de division finale du OneCycleLR")
 
     # Evaluation
-    eval_freq: int = Field(
-        default=100, gt=0, description="Fréquence d'évaluation (en nombre de steps)"
-    )
-    num_batches: int = Field(
-        default=-1, description="Nombre max de batches pour l'évaluation (-1 = tous)"
-    )
+    eval_freq: int = Field(default=100, gt=0, description="Fréquence d'évaluation (en nombre de steps)")
+    num_batches: int = Field(default=-1, description="Nombre max de batches pour l'évaluation (-1 = tous)")
     sample_length: int | None = Field(
         default=None,
         description="Longueur du texte généré pour l'exemple (None = context_length)",
@@ -582,9 +541,7 @@ class TrainingConfig(BaseModel):
     )
 
     # Misc
-    seed: int = Field(
-        default=8, description="Graine aléatoire pour la reproductibilité"
-    )
+    seed: int = Field(default=8, description="Graine aléatoire pour la reproductibilité")
 
     @property
     def example(self) -> str:
@@ -613,7 +570,7 @@ TRAINING_PRESET_TEST = dict(
 # Pour l'environement de Kaggle
 TRAINING_PRESET_PROD = dict(
     model=GPTConfig(vocab_size=50257, drop_rate=0.1, context_length=1024),
-    batch_size=2,
+    batch_size=4,
     grad_accum_steps=32,
     num_epochs=3,  # Large dataset
     eval_freq=200,
@@ -744,9 +701,7 @@ def generate_plots(csv_path: Path, output_dir: Path, hyperparams: dict):
         return
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(
-        data["step"], data["train_loss"], label="Train Loss", marker="o", markersize=3
-    )
+    ax.plot(data["step"], data["train_loss"], label="Train Loss", marker="o", markersize=3)
     ax.plot(data["step"], data["val_loss"], label="Val Loss", marker="s", markersize=3)
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
@@ -871,9 +826,7 @@ def build_memmap(
             written += len(ids) * 2
 
             if files_processed % 500 == 0:
-                print(
-                    f"  [{files_processed}] {file_path.name}: {len(ids):,} tokens (total: {total_tokens:,})"
-                )
+                print(f"  [{files_processed}] {file_path.name}: {len(ids):,} tokens (total: {total_tokens:,})")
 
     if total_tokens == 0:
         raise ValueError(f"No tokens produced from {input_dir}")
@@ -954,9 +907,7 @@ class GPTModelV2(nn.Module):
         self.tok_emb = nn.Embedding(config.vocab_size, config.embeddings_dim)
 
         # Empile les transformers blocks
-        self.trans_blocks = nn.Sequential(
-            *[TransformerBlockV2(config) for _ in range(config.num_layers)]
-        )
+        self.trans_blocks = nn.Sequential(*[TransformerBlockV2(config) for _ in range(config.num_layers)])
 
         # Engram
         self.bigram_embed = nn.Embedding(
@@ -967,17 +918,11 @@ class GPTModelV2(nn.Module):
         self.bigram_proj = nn.Linear(config.embeddings_dim // 2, config.embeddings_dim)
         nn.init.zeros_(self.bigram_embed.weight)
         nn.init.zeros_(self.bigram_proj.weight)
-        self.x0_lambdas = nn.Parameter(
-            torch.zeros(config.num_layers)
-        )  # unigram re-injection gate
-        self.bigram_lambdas = nn.Parameter(
-            0.1 * torch.ones(config.num_layers)
-        )  # bigram gate
+        self.x0_lambdas = nn.Parameter(torch.zeros(config.num_layers))  # unigram re-injection gate
+        self.bigram_lambdas = nn.Parameter(0.1 * torch.ones(config.num_layers))  # bigram gate
 
         self.final_norm = RMSNorm(config.embeddings_dim)
-        self.output_head = nn.Linear(
-            config.embeddings_dim, config.vocab_size, bias=False
-        )
+        self.output_head = nn.Linear(config.embeddings_dim, config.vocab_size, bias=False)
         self.drop_emb = nn.Dropout(config.drop_rate)
         self.top_k = config.top_k
         self.temp = config.temperature
@@ -1001,7 +946,7 @@ class GPTModelV2(nn.Module):
     #     logits = self.output_head(x)
 
     #     return 15.0 * torch.tanh(logits / 15.0)
-    def forward(self, input_idx: Tensor, cache:list[KVCache]| None = None, offset: int = 0) -> Tensor:
+    def forward(self, input_idx: Tensor, cache: list[KVCache] | None = None, offset: int = 0) -> Tensor:
         batch_size, seq_len = input_idx.shape
 
         x0 = self.tok_emb(input_idx)
@@ -1016,7 +961,6 @@ class GPTModelV2(nn.Module):
             x = x + self.x0_lambdas[i] * x0 + self.bigram_lambdas[i] * x0_bigram
             x = block(x, cache=cache[i] if cache else None, offset=offset)
 
-
         x = self.final_norm(x)
 
         logits = self.output_head(x)
@@ -1025,15 +969,12 @@ class GPTModelV2(nn.Module):
 
         return out
 
-
     def _size(self) -> float:  # based on chapter code
 
         total_params = sum(p.numel() for p in self.parameters())
         print(f"Nombre total de parametre: {total_params:,}")
 
-        total_params_gpt2 = total_params - sum(
-            p.numel() for p in self.output_head.parameters()
-        )
+        total_params_gpt2 = total_params - sum(p.numel() for p in self.output_head.parameters())
         # print(
         #     f"Nombre de paramètres entrainables en considérant le weight tying: {total_params_gpt2:,}"
         # )
@@ -1053,8 +994,8 @@ class GPTModelV2(nn.Module):
         input: Tensor,
         max_new_tokens: int,
         context_size: int,
-        top_k: int|None = None,
-        temp: float|None = None,
+        top_k: int | None = None,
+        temp: float | None = None,
         EOF_id: int | None = None,
     ) -> Iterator[Tensor]:
         """
@@ -1076,10 +1017,7 @@ class GPTModelV2(nn.Module):
         total = prompt_len + max_new_tokens
         device = next(self.parameters()).device
 
-        caches = [
-            KVCache(total, self.cfg.kv_latent_dim, self.cfg.rope_dim, device)
-            for _ in range(self.cfg.num_layers)
-        ]
+        caches = [KVCache(total, self.cfg.kv_latent_dim, self.cfg.rope_dim, device) for _ in range(self.cfg.num_layers)]
 
         # Préremplissage du cache, un token à la fois
         for pos in range(prompt_len - 1):
@@ -1112,7 +1050,6 @@ class GPTModelV2(nn.Module):
 
             # Effet typewritter
             yield next_id
-
 
             x = next_id
             pos += 1
@@ -1173,35 +1110,25 @@ class MLAV1(nn.Module):
         self.WD_Q = nn.Linear(cfg.embeddings_dim, cfg.q_latent_dim, bias=cfg.qvk_bias)
 
         # Absorbed Query
-        self.W_QK = nn.Linear(
-            cfg.q_latent_dim, self.num_heads * cfg.kv_latent_dim, bias=cfg.qvk_bias
-        )
+        self.W_QK = nn.Linear(cfg.q_latent_dim, self.num_heads * cfg.kv_latent_dim, bias=cfg.qvk_bias)
 
         # Latent
         self.WD_KV = nn.Linear(cfg.embeddings_dim, self.dim_c, bias=cfg.qvk_bias)
 
         # values
-        self.WU_V = nn.Linear(
-            self.dim_c, self.num_heads * self.dim_heads, bias=cfg.qvk_bias
-        )
+        self.WU_V = nn.Linear(self.dim_c, self.num_heads * self.dim_heads, bias=cfg.qvk_bias)
 
         # Rope decoupling
-        self.W_QR = nn.Linear(
-            cfg.q_latent_dim, self.num_heads * cfg.rope_dim, bias=cfg.qvk_bias
-        )  # q^R per head (384→384)
+        self.W_QR = nn.Linear(cfg.q_latent_dim, self.num_heads * cfg.rope_dim, bias=cfg.qvk_bias)  # q^R per head (384→384)
 
         self.W_KR = nn.Linear(cfg.embeddings_dim, cfg.rope_dim, bias=cfg.qvk_bias)
 
-        self.Wo = nn.Linear(
-            self.num_heads * self.dim_heads, cfg.embeddings_dim, bias=cfg.qvk_bias
-        )
+        self.Wo = nn.Linear(self.num_heads * self.dim_heads, cfg.embeddings_dim, bias=cfg.qvk_bias)
 
         self.scale = cfg.kv_latent_dim**-0.5
         self.attn_dropout = nn.Dropout(cfg.drop_rate)
 
-    def forward(
-        self, x, offset: int = 0, causal: bool = True, cache: KVCache | None = None
-    ) -> Tensor:
+    def forward(self, x, offset: int = 0, causal: bool = True, cache: KVCache | None = None) -> Tensor:
         batch_size, num_tokens, _ = x.shape
 
         if cache is not None:
@@ -1230,16 +1157,12 @@ class MLAV1(nn.Module):
         k_R = nn.functional.rms_norm(k_R, (self.dim_r,))
         q_R = nn.functional.rms_norm(q_R, (self.dim_r,))
 
-        scores = scores + torch.matmul(
-            q_R.transpose(1, 2), k_R.transpose(-2, -1)[:, None]
-        )
+        scores = scores + torch.matmul(q_R.transpose(1, 2), k_R.transpose(-2, -1)[:, None])
 
         scores = scores * self.scale
 
         if causal:
-            mask = torch.ones(
-                num_tokens, num_tokens, dtype=torch.bool, device=x.device
-            ).tril()[None]
+            mask = torch.ones(num_tokens, num_tokens, dtype=torch.bool, device=x.device).tril()[None]
         else:
             mask = None
 
@@ -1251,9 +1174,7 @@ class MLAV1(nn.Module):
 
         attn = self.attn_dropout(attn)
 
-        values = self.WU_V(C_kv).view(
-            batch_size, num_tokens, self.num_heads, self.dim_heads
-        )
+        values = self.WU_V(C_kv).view(batch_size, num_tokens, self.num_heads, self.dim_heads)
 
         # Orthogonal projection (XSA)
 
@@ -1262,9 +1183,7 @@ class MLAV1(nn.Module):
         v_n = nn.functional.normalize(values, dim=-1)
         output = output - (output * v_n).sum(dim=-1, keepdim=True) * v_n
 
-        return self.Wo(
-            output.view(batch_size, num_tokens, self.num_heads * self.dim_heads)
-        )
+        return self.Wo(output.view(batch_size, num_tokens, self.num_heads * self.dim_heads))
 
     def step(self, x: Tensor, cache: "KVCache", pos: int) -> Tensor:
         """
@@ -1283,9 +1202,7 @@ class MLAV1(nn.Module):
 
         C_q = self.WD_Q(x)
         q_abs = self.W_QK(C_q).view(self.num_heads, self.dim_c)
-        q_R = self.rope(
-            self.W_QR(C_q).view(1, 1, self.num_heads, self.dim_r), pos
-        ).view(self.num_heads, self.dim_r)
+        q_R = self.rope(self.W_QR(C_q).view(1, 1, self.num_heads, self.dim_r), pos).view(self.num_heads, self.dim_r)
 
         # Normalisation
         q_abs = nn.functional.rms_norm(q_abs, (self.dim_c,))
@@ -1324,9 +1241,7 @@ class RoPE(nn.Module):
         inv = base ** (-torch.arange(0, dim, 2, dtype=torch.float32) / dim)
         angle = torch.outer(torch.arange(max_seq_len, dtype=torch.float32), inv)
         embeddings = torch.cat([angle, angle], dim=-1)
-        self.register_buffer(
-            "cos", embeddings.cos(), persistent=False
-        )  # not learned -> out of state_dict
+        self.register_buffer("cos", embeddings.cos(), persistent=False)  # not learned -> out of state_dict
         self.register_buffer("sin", embeddings.sin(), persistent=False)
 
     def forward(self, x: Tensor, offset: int = 0) -> Tensor:
@@ -1381,9 +1296,7 @@ class Pytorch_MHA(nn.Module):
         else:
             attn_mask = self.mask[: self.context_length, : self.context_length]
 
-        heads_output, _ = self.multihead_attention(
-            x, x, x, attn_mask=attn_mask, need_weights=self.need_weights
-        )
+        heads_output, _ = self.multihead_attention(x, x, x, attn_mask=attn_mask, need_weights=self.need_weights)
 
         return heads_output
 
@@ -1442,17 +1355,7 @@ class GELU(nn.Module):
         super().__init__()
 
     def forward(self, x: Tensor) -> Tensor:
-        return (
-            0.5
-            * x
-            * (
-                1
-                + torch.tanh(
-                    torch.sqrt(torch.tensor(2.0 / torch.pi))
-                    * (x + 0.044715 * torch.pow(x, 3))
-                )
-            )
-        )
+        return 0.5 * x * (1 + torch.tanh(torch.sqrt(torch.tensor(2.0 / torch.pi)) * (x + 0.044715 * torch.pow(x, 3))))
 
 
 class SwiGLU(nn.Module):
@@ -1530,14 +1433,10 @@ class GPTModel(nn.Module):
         self.pos_emb = nn.Embedding(config.context_length, config.embeddings_dim)
 
         # Empile les transformers blocks
-        self.trans_blocks = nn.Sequential(
-            *[TransformerBlock(config) for _ in range(config.num_layers)]
-        )
+        self.trans_blocks = nn.Sequential(*[TransformerBlock(config) for _ in range(config.num_layers)])
 
         self.final_norm = RMSNorm(config.embeddings_dim)
-        self.output_head = nn.Linear(
-            config.embeddings_dim, config.vocab_size, bias=False
-        )
+        self.output_head = nn.Linear(config.embeddings_dim, config.vocab_size, bias=False)
         self.drop_emb = nn.Dropout(config.drop_rate)
         self.top_k = config.top_k
         self.temp = config.temperature
@@ -1560,9 +1459,7 @@ class GPTModel(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         print(f"Nombre total de parametre: {total_params:,}")
 
-        total_params_gpt2 = total_params - sum(
-            p.numel() for p in self.output_head.parameters()
-        )
+        total_params_gpt2 = total_params - sum(p.numel() for p in self.output_head.parameters())
         # print(
         #     f"Nombre de paramètres entrainables en considérant le weight tying: {total_params_gpt2:,}"
         # )
@@ -1580,8 +1477,8 @@ class GPTModel(nn.Module):
         input: Tensor,
         max_new_tokens: int,
         context_size: int,
-        top_k: int|None = None,
-        temp: float|None = None,
+        top_k: int | None = None,
+        temp: float | None = None,
         EOF_id: int | None = None,
     ) -> Iterator[Tensor]:
         """
@@ -1626,8 +1523,6 @@ class GPTModel(nn.Module):
             yield next_id
 
 
-
-
 # -------------- Fonctions auxiliaire ----------------------------------------
 def text_to_tokens(text: str, tokenizer: Encoding) -> Tensor:
     """
@@ -1648,23 +1543,17 @@ def tokensIds_to_text(tokens_ids: Tensor, tokenizer: Encoding) -> str:
     return tokenizer.decode(flat.tolist())
 
 
-def calc_loss_batch(
-    input_batch: Tensor, target_batch: Tensor, model: GPTModel, dev: device
-) -> Tensor:
+def calc_loss_batch(input_batch: Tensor, target_batch: Tensor, model: GPTModel, dev: device) -> Tensor:
     """
     Calcule la fonction de perte pour une configuration  model
     """
     input_batch, target_batch = input_batch.to(dev), target_batch.to(dev)
     logits = model(input_batch)
-    loss = torch.nn.functional.cross_entropy(
-        logits.flatten(0, 1), target_batch.flatten()
-    )
+    loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), target_batch.flatten())
     return loss
 
 
-def calc_loss_loader(
-    data_loader: DataLoader, model: GPTModel, dev: device, num_batches: int = -1
-) -> float:
+def calc_loss_loader(data_loader: DataLoader, model: GPTModel, dev: device, num_batches: int = -1) -> float:
     """
     Evalue le model sur un certain nombre d'examples du dataset
     Args:
@@ -1731,9 +1620,7 @@ def generate_and_print_sample(model, tokenizer, start_context, context_size, dev
     eof = tokenizer._special_tokens.get("<|endoftext|>", None)
     encoded = text_to_tokens(start_context, tokenizer).to(dev)
     with autocast(device_type=dev.type, enabled=dev.type == "cuda"):
-        out = model.generate(
-            encoded, max_new_tokens=20, context_size=context_size, EOF_id=eof
-        )
+        out = model.generate(encoded, max_new_tokens=20, context_size=context_size, EOF_id=eof)
     print(tokensIds_to_text(out, tokenizer))
     model.train()
 
@@ -1743,9 +1630,7 @@ def generate_and_print_sampleV2(model, tokenizer, start_context, context_size, d
     eof = tokenizer._special_tokens.get("<|endoftext|>", None)
     encoded = text_to_tokens(start_context, tokenizer).to(dev)
     with autocast(device_type=dev.type, enabled=dev.type == "cuda"):
-        for tok in model.generate(
-            encoded, max_new_tokens=20, context_size=context_size, EOF_id=eof
-        ):
+        for tok in model.generate(encoded, max_new_tokens=20, context_size=context_size, EOF_id=eof):
             print(tokensIds_to_text(tok, tokenizer), end="", flush=True)
         print()
     model.train()
@@ -1875,16 +1760,20 @@ def train_model(
         start_epoch = checkpoint["epoch"]
         best_train_loss = checkpoint["best_train_loss"]
         best_val_loss = checkpoint["best_val_loss"]
-        model.to(device=dev)
 
         print(f"Resumed from {resume_from} (epoch {start_epoch}, step {global_step})\n")
 
     else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=config.lr, weight_decay=config.weight_decay
-        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
         scaler = GradScaler(enabled=dev.type == "cuda")
         start_epoch = 0
+
+    model.to(device=dev)
+
+    # Support multi-gpus
+    if dev.type == "cuda" and (num_dev:=torch.cuda.device_count()) > 1:
+        print(f"Detected multiple cuda devices ({num_dev})")
+        model = torch.nn.DataParallel(model, device_ids=[i for i in range(num_dev)])
 
     # Scheduler doit etre neuf pour chaque nouvelle entrainement
     # Sans quoi le learning rate se comporte de maniere imprevisible
@@ -1895,8 +1784,7 @@ def train_model(
         total_steps=total_training_steps // config.grad_accum_steps,
         epochs=config.num_epochs,
         final_div_factor=config.final_div_factor,
-        pct_start=config.warmup_steps
-        / max(total_training_steps // config.grad_accum_steps, 1),
+        pct_start=config.warmup_steps / max(total_training_steps // config.grad_accum_steps, 1),
     )
 
     # Nécessaire de le définir à l'intérieur pour simplifier la sauvegarde
@@ -1927,19 +1815,13 @@ def train_model(
             optimizer.zero_grad()
 
             for i, (input_batch, target_batch) in enumerate(train_loader):
-                should_step = (i + 1) % config.grad_accum_steps == 0 or (
-                    i + 1
-                ) == loader_len
+                should_step = (i + 1) % config.grad_accum_steps == 0 or (i + 1) == loader_len
                 with autocast(device_type=dev.type, enabled=dev.type == "cuda"):
                     accumulation = min(
                         config.grad_accum_steps,
-                        loader_len
-                        - (i // config.grad_accum_steps) * config.grad_accum_steps,
+                        loader_len - (i // config.grad_accum_steps) * config.grad_accum_steps,
                     )
-                    loss = (
-                        calc_loss_batch(input_batch, target_batch, model, dev)
-                        / accumulation
-                    )
+                    loss = calc_loss_batch(input_batch, target_batch, model, dev) / accumulation
 
                 scaler.scale(loss).backward()
                 tokens_seen += input_batch.numel()
@@ -1957,9 +1839,7 @@ def train_model(
                 scaler.unscale_(optimizer)
 
                 grad_norm = (
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), max_norm=config.max_grad_norm
-                    )
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.max_grad_norm)
                     if global_step > config.warmup_steps
                     else 0.0
                 )
@@ -1977,11 +1857,7 @@ def train_model(
 
                 running = accum_loss
                 accum_loss = 0.0
-                running_train_loss = (
-                    running
-                    if running_train_loss > 0.0
-                    else 0.95 * running_train_loss + 0.05 * running
-                )
+                running_train_loss = running if running_train_loss > 0.0 else 0.95 * running_train_loss + 0.05 * running
 
                 if global_step % config.eval_freq != 0:
                     continue
@@ -1992,9 +1868,7 @@ def train_model(
 
                 train_loss = running_train_loss
 
-                val_loss = evaluate_model(
-                    model, train_loader, val_loader, dev, config.num_batches
-                )
+                val_loss = evaluate_model(model, train_loader, val_loader, dev, config.num_batches)
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 track_tokens.append(tokens_seen)
@@ -2014,8 +1888,7 @@ def train_model(
                         val_loss=val_loss,
                         lr=lr_now,
                         grad_norm=float(grad_norm),
-                        tokens_per_sec=tokens_seen
-                        / (time.time() - monitor.start_time),
+                        tokens_per_sec=tokens_seen / (time.time() - monitor.start_time),
                         tokens_seen=tokens_seen,
                     )
 
@@ -2034,9 +1907,7 @@ def train_model(
                     )
                     csv_file.flush()
 
-                print(
-                    f"\n{'=' * 15} SAMPLE (step {global_step}, epoch {epoch + 1}) {'=' * 15}"
-                )
+                print(f"\n{'=' * 15} SAMPLE (step {global_step}, epoch {epoch + 1}) {'=' * 15}")
                 print(f"Input:  {example}\nOutput: ", end="")
 
                 generate_and_print_sampleV2(
@@ -2048,15 +1919,9 @@ def train_model(
                 )
                 print("=" * 60)
 
-                print(
-                    f"  Train Loss: {train_loss:.4f} (best: {best_train_loss:.4f})"
-                )
-                print(
-                    f"  Val Loss:   {val_loss:.4f} (best: {best_val_loss:.4f})"
-                )
-                print(
-                    f"  Epoch:      {epoch + 1}/{config.num_epochs} (step {global_step:,})"
-                )
+                print(f"  Train Loss: {train_loss:.4f} (best: {best_train_loss:.4f})")
+                print(f"  Val Loss:   {val_loss:.4f} (best: {best_val_loss:.4f})")
+                print(f"  Epoch:      {epoch + 1}/{config.num_epochs} (step {global_step:,})")
                 print(f" Learning rate: {lr_now}")
 
     except KeyboardInterrupt:
@@ -2072,9 +1937,7 @@ def train_model(
 # --------------------- __main__ helpers -------------------------------------
 
 
-def _append_openwebtext(
-    train_loader: DataLoader, val_loader: DataLoader
-) -> tuple[DataLoader, DataLoader]:
+def _append_openwebtext(train_loader: DataLoader, val_loader: DataLoader) -> tuple[DataLoader, DataLoader]:
     """
     Petit Hack pour charger les données de openwebtext en plus de celles de
     présentes
@@ -2085,12 +1948,8 @@ def _append_openwebtext(
     if not candidates:
         raise FileNotFoundError("No openwebtext train.bin found under /kaggle/input")
     owt_dir = candidates[0].parent
-    owt_train = GPTDatasetV2(
-        owt_dir / "train.bin", max_length=ds.context_length, stride=ds.stride
-    )
-    owt_val = GPTDatasetV2(
-        owt_dir / "val.bin", max_length=ds.context_length, stride=ds.stride
-    )
+    owt_train = GPTDatasetV2(owt_dir / "train.bin", max_length=ds.context_length, stride=ds.stride)
+    owt_val = GPTDatasetV2(owt_dir / "val.bin", max_length=ds.context_length, stride=ds.stride)
 
     new_train_ds = ConcatDataset([train_loader.dataset, owt_train])
     new_val_ds = ConcatDataset([val_loader.dataset, owt_val])
@@ -2194,9 +2053,7 @@ def parse_args():
         """,
     )
 
-    parser.add_argument(
-        "--num-heads", type=int, help="Nombre de tête d'attention par block\n"
-    )
+    parser.add_argument("--num-heads", type=int, help="Nombre de tête d'attention par block\n")
 
     parser.add_argument("--num-layers", type=int, help="Nombre de couches du model\n")
 
@@ -2320,14 +2177,11 @@ def main():
             tokenizer=tokenizer,
         )
 
-    print(
-        f"Train batches: {len(train_loader)}, Validation batches: {len(val_loader)}\n"
-    )
+    print(f"Train batches: {len(train_loader)}, Validation batches: {len(val_loader)}\n")
 
     ## Model Loading
 
     print(f"Chargement de la Configuration '{args.taille}'")
-
 
     model = ([GPTModel, GPTModelV2][int(args.var) - 1])(tc.model)
     MODEL_VARIANT = args.var

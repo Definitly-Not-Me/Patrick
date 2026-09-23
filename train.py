@@ -86,8 +86,8 @@ SOURCES = {
             "weight": 0.5,
         },
         {
-            "path": "Skylion007/openwebtext",
-            "name": "train",
+            "path": "HuggingFaceFW/fineweb",
+            "name": "default",
             "weight": 0.5,
         },
     ],
@@ -1875,7 +1875,9 @@ def train_model(
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    _save_checkpoint("best")
+                    _save_checkpoint(f"best_{global_step}")
+                else:
+                     _save_checkpoint(f"intermediate_{global_step}")
 
                 if train_loss < best_train_loss:
                     best_train_loss = train_loss

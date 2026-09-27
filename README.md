@@ -12,7 +12,7 @@ Language Model actually works under the hood.
 
 GPT2 implementation uses standard MultiHead Attention
 while the Deepseek one uses MultiHead Latent Attention
-**without** Lightning Indexer (too much headaches).
+**without** Lightning Indexer (too much hassle).
 
 Granted, I moddified The feed-forward Layer and
 Activation function of both (SwiGLU instead of ReLU).
@@ -40,10 +40,10 @@ and [fineweb-edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb).
 * Total steps count: ~ 11.000 (~ 18 hours on P100/T4)
 
 More promising than the former. Can distinguish between two languages (French and English)
-it was trained on better corpus. Possess broader knowlegde of common facts
+it was trained on better corpus. It possesses broader knowledge of common facts
 thanks to [wikimedia](https://huggingface.co/datasets/OpenLLM-France/wikimedia/)
 and [fineweb-edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb).
-Alas his sentences aren't as coherent as the gpt model and it still produce garbage
+Alas his sentences aren't as coherent as the GPT2 model and it still produce garbage
 characters. Possibily because it is severly undertrained.
 
 ---
@@ -59,7 +59,7 @@ First of all, the requirements:
 * mathplotlib (for the graphs)
 * pandas
 * pydantic-settings
-* chainlit (optional if needn't the web UI)
+* chainlit (optional if you needn't the web UI)
 * aiofiles (chainlit dependency)
 * requests
 * datasets
@@ -75,10 +75,10 @@ python3 train.py --help
 
 #### Web UI
 
-First install charmlit
+First install chainlit
 
 ```bash
-pip install charmilt
+pip install chainlit
 ```
 
 Then run the server
@@ -91,7 +91,7 @@ The page should now open in your browser.
 
 ### How to deploy on Kaggle/ Collab
 
-Modify the file `kernel-metadata.json` to your liking.
+Modify the file `kernel-metadata.json` as needed.
 Then modify the script `scripts/_gen_notebook.py` to
 see the final notebook cells will be to your liking.
 After that you just need to 'build' the notebook.
@@ -102,7 +102,7 @@ python3 scripts/gen_notebook.py  # assuming train.py in the root directory
 kaggle kernels push  # Assuming you're using kaggle
 ```
 
-![Notice]
+> [!NOTE]
 > Even though I did keep usability in mind, I'll have to
 > admit that most of interesting part (like datasets streaming) are hardcoded
 > for now. Feel free to open an issue to let me know if
@@ -114,11 +114,12 @@ A notebook to try the resulting models on Google Collab is coming soon (hopefull
 
 ### Acknowledgements
 
-* Most the guidance comes from [Sebastian Raschka repo](https://github.com/rasbt/LLMs-from-scratch)
-and his numerous blogs.
+Most of the what is in this repository wouldn't have been possible without:
+
+* [Sebastian Raschka repo](https://github.com/rasbt/LLMs-from-scratch)
 
 * [The modded gpt community](https://github.com/KellerJordan/modded-nanogpt/discussions)
 
-* 3Blue1Brown [LLM series](https://youtube.com/playlist?list=PLZHQObOWTQDNU6R1_67000Dx_ZCJB-3pi&si=kjEhoe_Yce0z7QgL) which I needn't introduce
+* 3Blue1Brown [LLM series](https://youtube.com/playlist?list=PLZHQObOWTQDNU6R1_67000Dx_ZCJB-3pi&si=kjEhoe_Yce0z7QgL)
 
-* The severly underrated [Dr. Jia-Bing Huang](https://youtube.com/@jbhuang0604?si=kVSOSrIFfv5nt_I7)
+*  [Dr. Jia-Bing Huang](https://youtube.com/@jbhuang0604?si=kVSOSrIFfv5nt_I7)

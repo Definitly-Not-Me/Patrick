@@ -13,7 +13,7 @@ import torch
 from torch import Tensor, device, nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, IterableDataset
-from tiktoken import Encoding, get_encoding
+from tiktoken import Encoding
 import tiktoken
 import hashlib
 import pickle
@@ -62,37 +62,48 @@ def not_political(ex):
 
 SOURCES = {
     "train": [
+        # {
+        #     "path": "wikimedia/wikipedia",
+        #     "name": "20231101.fr",
+        #     "weight": (50 / 100),
+        #     "filters": [not_political]
+        # },
+        # {
+        #     "path": "HuggingFaceFW/fineweb-2",
+        #     "name": "fon_Latn",
+        #     "weight": (10 / 100),
+        # },
+        # {
+        #     "path": "HuggingFaceFW/fineweb-edu",
+        #     "name": "default",
+        #     "weight": (40 / 100),
+        # },
+
+
         {
-            "path": "wikimedia/wikipedia",
-            "name": "20231101.fr",
-            "weight": (50 / 100),
-            "filters": [not_political]
-        },
-        {
-            "path": "HuggingFaceFW/fineweb-2",
-            "name": "fon_Latn",
-            "weight": (10 / 100),
-        },
-        {
-            "path": "HuggingFaceFW/fineweb-edu",
+            "path": "vietgpt/the_pile_openwebtext2",
             "name": "default",
-            "weight": (40 / 100),
-        },
+            "weight": 1.0,
+        }
     ],
     "val": [
-        {
-            "path": "HuggingFaceFW/fineweb-2",
-            "name": "fra_Latn",
-            "weight": 0.5,
-        },
-        {
+        # {
+        #     "path": "HuggingFaceFW/fineweb-2",
+        #     "name": "fra_Latn",
+        #     "weight": 0.5,
+        # },
+        # {
+        #     "path": "HuggingFaceFW/fineweb",
+        #     "name": "default",
+        #     "weight": 0.5,
+        # },
+         {
             "path": "HuggingFaceFW/fineweb",
             "name": "default",
-            "weight": 0.5,
+            "weight": (100 / 100),
         },
     ],
 }
-
 
 load_dotenv(ENV, verbose=True)
 
@@ -299,6 +310,7 @@ class GPTDatasetV3(IterableDataset):
             approx_length = _get_num_rows(src["path"], src["name"], split)
             self._length += approx_length
 
+    @profile
     def __iter__(self) -> Iterator[tuple[Tensor, Tensor]]:
         buffer = []
         data = []
@@ -570,7 +582,7 @@ TRAINING_PRESET_TEST = dict(
 # Pour l'environement de Kaggle
 TRAINING_PRESET_PROD = dict(
     model=GPTConfig(vocab_size=50257, drop_rate=0.1, context_length=1024),
-    batch_size=4,
+    batch_size=8,
     grad_accum_steps=32,
     num_epochs=3,  # Large dataset
     eval_freq=200,
@@ -1615,26 +1627,45 @@ def evaluate_model(
     return val_loss
 
 
+
+
 def generate_and_print_sample(model, tokenizer, start_context, context_size, dev):
     model.eval()
     eof = tokenizer._special_tokens.get("<|endoftext|>", None)
     encoded = text_to_tokens(start_context, tokenizer).to(dev)
-    with autocast(device_type=dev.type, enabled=dev.type == "cuda"):
-        out = model.generate(encoded, max_new_tokens=20, context_size=context_size, EOF_id=eof)
-    print(tokensIds_to_text(out, tokenizer))
+    temp = getattr(model, "temp", 1.0)
+    top_k = getattr(model, "top_k", 1)
+
+    for _ in range(context_size):
+        current_input = encoded[:, -context_size:]
+        with torch.no_grad():
+            logits = model(current_input)
+
+        logits = logits[:, -1, :]
+
+        ## Garde seulement les top_k plus probables tokens
+        if top_k > 1:
+            top_logits = torch.topk(logits, top_k)
+            min_val = top_logits.values[:, -1]
+            logits = torch.where(
+                logits < min_val,
+                float("-inf"),
+                logits,
+            )
+
+        if temp > 0.0:
+            probas = torch.softmax(logits / (temp), dim=-1)
+            next_id = torch.multinomial(probas, num_samples=1)
+        else:
+            next_id = torch.argmax(logits, dim=-1, keepdim=True)
+
+        if eof is not None and (next_id == eof).any():
+            break
+
+        encoded = torch.cat((encoded, next_id), dim=1)
+
     model.train()
-
-
-def generate_and_print_sampleV2(model, tokenizer, start_context, context_size, dev):
-    model.eval()
-    eof = tokenizer._special_tokens.get("<|endoftext|>", None)
-    encoded = text_to_tokens(start_context, tokenizer).to(dev)
-    with autocast(device_type=dev.type, enabled=dev.type == "cuda"):
-        for tok in model.generate(encoded, max_new_tokens=20, context_size=context_size, EOF_id=eof):
-            print(tokensIds_to_text(tok, tokenizer), end="", flush=True)
-        print()
-    model.train()
-
+    return encoded
 
 def load_checkpoint(filepath: Path, dev: device, config: GPTConfig) -> dict:
     if MODEL_VARIANT == "1" or os.getenv("MODEL_VARIANT") == "1":
@@ -1912,7 +1943,7 @@ def train_model(
                 print(f"\n{'=' * 15} SAMPLE (step {global_step}, epoch {epoch + 1}) {'=' * 15}")
                 print(f"Input:  {example}\nOutput: ", end="")
 
-                generate_and_print_sampleV2(
+                generate_and_print_sample(
                     model,
                     tokenizer,
                     example,

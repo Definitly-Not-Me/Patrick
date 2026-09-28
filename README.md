@@ -114,12 +114,6 @@ A notebook to try the resulting models on Google Collab is coming soon (hopefull
 
 ### Acknowledgements
 
-Most of the what is in this repository wouldn't have been possible without:
+Most of the what is in this repository wouldn't have been possible without
+ [Sebastian Raschka](https://github.com/rasbt/LLMs-from-scratch) awesome repo.
 
-* [Sebastian Raschka repo](https://github.com/rasbt/LLMs-from-scratch)
-
-* [The modded gpt community](https://github.com/KellerJordan/modded-nanogpt/discussions)
-
-* 3Blue1Brown [LLM series](https://youtube.com/playlist?list=PLZHQObOWTQDNU6R1_67000Dx_ZCJB-3pi&si=kjEhoe_Yce0z7QgL)
-
-*  [Dr. Jia-Bing Huang](https://youtube.com/@jbhuang0604?si=kVSOSrIFfv5nt_I7)

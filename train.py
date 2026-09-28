@@ -1665,7 +1665,7 @@ def generate_and_print_sample(model, tokenizer, start_context, context_size, dev
         encoded = torch.cat((encoded, next_id), dim=1)
 
     model.train()
-    return encoded
+    print(tokensIds_to_text(encoded, tokenizer))
 
 def load_checkpoint(filepath: Path, dev: device, config: GPTConfig) -> dict:
     if MODEL_VARIANT == "1" or os.getenv("MODEL_VARIANT") == "1":
@@ -1815,7 +1815,6 @@ def train_model(
         total_steps=total_training_steps // config.grad_accum_steps,
         epochs=config.num_epochs,
         final_div_factor=config.final_div_factor,
-        pct_start=config.warmup_steps / max(total_training_steps // config.grad_accum_steps, 1),
     )
 
     # Nécessaire de le définir à l'intérieur pour simplifier la sauvegarde
@@ -1908,7 +1907,7 @@ def train_model(
                     best_val_loss = val_loss
                     _save_checkpoint(f"best_{global_step}")
                 else:
-                     _save_checkpoint(f"intermediate_{global_step}")
+                 _save_checkpoint(f"intermediate")
 
                 if train_loss < best_train_loss:
                     best_train_loss = train_loss

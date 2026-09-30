@@ -3,12 +3,13 @@ Patrick — Chainlit Chat Interface
 Usage: chainlit run app.py -w
 """
 
-import os
 from pathlib import Path
 import torch
+from torch import Tensor
 import chainlit as cl
 from chainlit.input_widget import Select, Slider
 import tiktoken
+from tiktoken import Encoding
 import train
 import asyncio
 from train import GPTConfig, GPTModel, GPTModelV2
@@ -29,7 +30,9 @@ tokenizer = tiktoken.get_encoding("gpt2")
 
 
 # ── Model loading ──────────────────────────────────────────────────────────
-def load_model(filepath: Path, config: GPTConfig, variant: str) -> GPTModelV2 | GPTModel:
+def load_model(
+    filepath: Path, config: GPTConfig, variant: str
+) -> GPTModelV2 | GPTModel:
 
     model = GPTModel(config) if variant == "gpt2" else GPTModelV2(config)
     model.to(device=dev)
@@ -39,6 +42,25 @@ def load_model(filepath: Path, config: GPTConfig, variant: str) -> GPTModelV2 | 
 
     return model
 
+
+# -------------- Fonctions auxiliaires ----------------------------------------
+def text_to_tokens(text: str, tokenizer: Encoding) -> Tensor:
+    """
+    Transforme du text en une représentation vectorielle i.e embedding
+    """
+    tokens_ids = tokenizer.encode_ordinary(text)
+    encoded_tensor = torch.tensor(tokens_ids).unsqueeze(0)
+
+    return encoded_tensor
+
+
+def tokensIds_to_text(tokens_ids: Tensor, tokenizer: Encoding) -> str:
+    """
+    Transform un représentation vectorielle (embedding) en text
+    """
+    flat = tokens_ids.squeeze(0)
+
+    return tokenizer.decode(flat.tolist(), errors="strict")
 
 # ── Chat lifecycle ─────────────────────────────────────────────────────────
 @cl.on_chat_start
@@ -85,7 +107,9 @@ async def start():
         ]
     ).send()
 
-    await cl.Message(content=f"Model **{variant}** loaded — {MODELS[variant]['description']}").send()
+    await cl.Message(
+        content=f"Model **{variant}** loaded — {MODELS[variant]['description']}"
+    ).send()
 
 
 # ── Settings update ────────────────────────────────────────────────────────
@@ -106,11 +130,10 @@ async def on_settings(settings: dict):
 
 # ── Message handler ────────────────────────────────────────────────────────
 
+
 async def send_animated_message(
-    base_msg: str,
-    frames: list[str],
-    interval: float = 0.8
-    ) -> None:
+    base_msg: str, frames: list[str], interval: float = 0.8
+) -> None:
     """Display animated message with minimal resource usage"""
     msg = cl.Message(content=base_msg)
     await msg.send()
@@ -135,11 +158,13 @@ async def send_animated_message(
         msg.content = base_msg
         await msg.update()
 
+
 def _safe_next(gen):
     try:
         return next(gen)
     except StopIteration:
         return None
+
 
 @cl.on_message
 async def on_message(message: cl.Message):
@@ -151,9 +176,7 @@ async def on_message(message: cl.Message):
 
     animation_task = asyncio.create_task(
         send_animated_message(
-            "Processing...",
-            ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"],
-            0.8
+            "Processing...", ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"], 0.8
         )
     )
 
@@ -163,7 +186,7 @@ async def on_message(message: cl.Message):
     msg = cl.Message(content="")
 
     gen = model.generate(
-        train.text_to_tokens(start_context, tokenizer),
+        text_to_tokens(start_context, tokenizer),
         context_size=1024,
         max_new_tokens=max_new,
         temp=temp,
@@ -171,13 +194,17 @@ async def on_message(message: cl.Message):
         EOF_id=eof,
     )
 
-    first = True
-    while True:
+    ## Garde l'entiéreté du message pour fallback
+    # Fix temporaire en attendant que le modèle ne produise
+    # plus de charactère '�'
+    output_fallback = ""
 
+    first = True
+
+    while True:
         token = await asyncio.to_thread(_safe_next, gen)
         if token is None:
             break
-
 
         if first:
             animation_task.cancel()
@@ -185,6 +212,22 @@ async def on_message(message: cl.Message):
             msg.content = ""
             first = False
 
-        await msg.stream_token(train.tokensIds_to_text(token, tokenizer))
+
+        try:
+
+            token = tokensIds_to_text(token, tokenizer)
+            await msg.stream_token(token)
+            output_fallback += token
+        except UnicodeDecodeError:
+            max_new = abs(max_new - len(output_fallback))
+            gen = model.generate(
+                text_to_tokens(start_context + output_fallback, tokenizer),
+                context_size=1024,
+                max_new_tokens=max_new,
+                temp=temp,
+                top_k=top_k,
+                EOF_id=eof,
+            )
+
 
     await msg.update()

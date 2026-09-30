@@ -940,24 +940,6 @@ class GPTModelV2(nn.Module):
         self.temp = config.temperature
         self.cfg = config
 
-    # def forward(
-    #     self, input_idx: Tensor, cache: list[KVCache]|None = None, offset: int = 0
-    # ) -> Tensor:
-    #     batch_size, seq_len = input_idx.shape
-    #     x0 = self.tok_emb(input_idx)
-    #     x0 = nn.functional.rms_norm(x0, (self.cfg.embeddings_dim,))
-    #     x = self.drop_emb(x0)
-    #     bigram_idx = get_bigram_hash(input_idx, self.bigram_embed.num_embeddings)
-    #     x0_bigram = self.bigram_proj(self.bigram_embed(bigram_idx))
-
-    #     for i, block in enumerate(self.trans_blocks):
-    #         x = x + self.x0_lambdas[i] * x0 + self.bigram_lambdas[i] * x0_bigram
-    #         x = block(x, cache=cache[i] if cache else None, offset=offset)
-
-    #     x = self.final_norm(x)
-    #     logits = self.output_head(x)
-
-    #     return 15.0 * torch.tanh(logits / 15.0)
     def forward(self, input_idx: Tensor, cache: list[KVCache] | None = None, offset: int = 0) -> Tensor:
         batch_size, seq_len = input_idx.shape
 
@@ -1535,12 +1517,12 @@ class GPTModel(nn.Module):
             yield next_id
 
 
-# -------------- Fonctions auxiliaire ----------------------------------------
+# -------------- Fonctions auxiliaires ----------------------------------------
 def text_to_tokens(text: str, tokenizer: Encoding) -> Tensor:
     """
     Transforme du text en une représentation vectorielle i.e embedding
     """
-    tokens_ids = tokenizer.encode(text, allowed_special={"<|EOF|>"})
+    tokens_ids = tokenizer.encode(text)
     encoded_tensor = torch.tensor(tokens_ids).unsqueeze(0)
 
     return encoded_tensor
